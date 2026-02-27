@@ -2,6 +2,8 @@
 
 Institutional-style research and dashboard toolkit for U.S. federal lobbying disclosures and equity signal analysis.
 
+[![CI](https://github.com/sykurtyppi/Lobbying-tracker/actions/workflows/ci.yml/badge.svg)](https://github.com/sykurtyppi/Lobbying-tracker/actions/workflows/ci.yml)
+
 ## What It Does
 
 - Ingests Senate LDA filings and builds normalized company-quarter spend data
@@ -49,3 +51,9 @@ venv/bin/python src/backtest_signal_research.py --db data/lobbying_data.db --out
 - Default local database path: `data/lobbying_data.db`
 - Uses lag-adjusted Q4 signal windows for forward return alignment
 - See `documentation/` for workflow and interface details
+
+## Repository Standards
+
+- Contribution guide: `CONTRIBUTING.md`
+- Security policy: `SECURITY.md`
+- License: `LICENSE`
