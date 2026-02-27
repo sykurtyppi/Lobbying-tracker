@@ -1,0 +1,7 @@
+factor,description,years,avg_top_1y,avg_alpha_vs_spx,median_alpha_vs_spx,win_rate_vs_spx_%,avg_alpha_vs_universe,win_rate_vs_universe_%,cum_top_1y_%,cum_spx_%,cum_alpha_vs_spx_%
+hist_spend_z,Z-score vs own history,4,23.82,11.06,13.37,100.0,8.39,75.0,127.57,52.41,75.16
+accel_score,Composite acceleration score,5,26.49,10.53,12.85,80.0,8.59,80.0,214.95,96.17,118.78
+sector_spike_z,Sector-normalized YoY z-score,5,24.67,8.71,3.02,60.0,6.76,60.0,197.02,96.17,100.85
+yoy_pct,YoY lobbying spend %,5,22.49,6.53,1.48,60.0,4.58,60.0,166.87,96.17,70.7
+qoq_pct,QoQ lobbying spend %,6,21.95,5.59,9.31,66.7,5.92,66.7,207.6,132.26,75.34
+mcap_ratio_yoy_pct,YoY change in spend/market-cap %,5,19.96,4.0,1.48,60.0,3.38,80.0,145.11,96.17,48.94
