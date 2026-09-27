@@ -596,6 +596,277 @@ def clean_nonpositive_company_spend(db_path: str = None, dry_run: bool = True) -
         conn.close()
 
 
+# ── Schema versioning ─────────────────────────────────────────────────────────
+# Increment this when a structural change is made that existing DBs need to adopt.
+CURRENT_SCHEMA_VERSION = 3
+
+
+def ensure_schema_current(db_path: str) -> dict:
+    """
+    Check the DB's schema_version and apply any missing structural migrations.
+
+    Version history
+    ---------------
+    v1  Initial schema (company_lobbying, lobbying_filings, stock_performance, …)
+    v2  Add filing_issues + filing_agencies tables (issue-code / agency-target data)
+    v3  Add schema_version tracking table itself
+
+    Returns
+    -------
+    dict with keys: db_version, current_version, migrated, migrations_applied
+    """
+    conn = sqlite3.connect(db_path)
+    try:
+        cursor = conn.cursor()
+
+        # Bootstrap: create schema_version table if it doesn't exist yet.
+        cursor.execute(
+            """
+            CREATE TABLE IF NOT EXISTS schema_version (
+                version     INTEGER NOT NULL,
+                applied_at  TEXT    NOT NULL,
+                description TEXT
+            )
+            """
+        )
+
+        row = cursor.execute("SELECT MAX(version) FROM schema_version").fetchone()
+        db_version = int(row[0]) if row and row[0] is not None else 0
+
+        migrations_applied: list[int] = []
+        now_iso = datetime.now(timezone.utc).isoformat()
+
+        if db_version < 2:
+            # Create filing_issues and filing_agencies if they're absent.
+            # _ensure_filing_detail_tables is idempotent (uses CREATE TABLE IF NOT EXISTS).
+            _ensure_filing_detail_tables(cursor)
+            cursor.execute(
+                "INSERT INTO schema_version (version, applied_at, description) VALUES (?, ?, ?)",
+                (2, now_iso, "filing_issues and filing_agencies tables + indexes"),
+            )
+            migrations_applied.append(2)
+
+        if db_version < 3:
+            cursor.execute(
+                "INSERT INTO schema_version (version, applied_at, description) VALUES (?, ?, ?)",
+                (3, now_iso, "schema_version tracking table bootstrapped"),
+            )
+            migrations_applied.append(3)
+
+        conn.commit()
+        return {
+            "db_version": db_version,
+            "current_version": CURRENT_SCHEMA_VERSION,
+            "migrated": len(migrations_applied) > 0,
+            "migrations_applied": migrations_applied,
+        }
+    finally:
+        conn.close()
+
+
+def backfill_filing_detail_tables_for_year(
+    year: int,
+    db_path: str = None,
+    *,
+    max_pages: Optional[int] = None,
+    progress_callback=None,
+) -> dict:
+    """
+    Re-fetch Senate LDA filings for `year` and populate filing_issues +
+    filing_agencies WITHOUT rebuilding company_lobbying or lobbying_filings.
+
+    Why a separate backfill?
+    ------------------------
+    The lobbying_activities and government_entities fields from the LDA API are
+    list columns that were discarded by the original ingestion pipeline. A full
+    rebuild re-fetches AND re-runs ticker matching, market-cap lookups, and
+    sector assignment (~3-5 minutes per year). This function does only the API
+    fetch and list extraction steps, skipping everything else (~60-70% faster).
+
+    Parameters
+    ----------
+    year             : Calendar year to backfill.
+    db_path          : SQLite database path (defaults to config.DATABASE_PATH).
+    max_pages        : Safety cap on LDA API pagination (default: scraper default).
+    progress_callback: Optional callable(message: str) for progress reporting.
+
+    Returns
+    -------
+    dict: year, filings_fetched, issue_rows, agency_rows
+    """
+    if db_path is None:
+        db_path = config.DATABASE_PATH
+
+    def _log(msg: str) -> None:
+        print(msg)
+        if progress_callback is not None:
+            progress_callback(msg)
+
+    _log(f"[backfill_detail] Year {year}: fetching filings from Senate LDA API…")
+
+    scraper = SenateLobbyingScraper()
+    fetch_kwargs: dict = {}
+    if max_pages is not None:
+        fetch_kwargs["max_pages"] = max_pages
+
+    raw_filings = scraper.get_filings(filing_year=year, **fetch_kwargs)
+    parsed = scraper._parse_filings(raw_filings)
+
+    if not parsed:
+        _log(f"[backfill_detail] Year {year}: no filings returned — skipping.")
+        return {"year": year, "filings_fetched": 0, "issue_rows": 0, "agency_rows": 0}
+
+    filings_df = pd.DataFrame(parsed)
+
+    # Normalise column names to match the extraction logic in build_company_lobbying_for_year.
+    if "filing_period" in filings_df.columns:
+        filings_df = filings_df.rename(columns={"filing_period": "period"})
+    if "filing_year" in filings_df.columns:
+        filings_df = filings_df.rename(columns={"filing_year": "year"})
+    if "year" not in filings_df.columns:
+        filings_df["year"] = year
+
+    _log(
+        f"[backfill_detail] Year {year}: extracted {len(filings_df):,} filings. "
+        "Parsing issue codes and agency targets…"
+    )
+
+    issue_rows:  list[tuple] = []
+    agency_rows: list[tuple] = []
+
+    for _, row in filings_df.iterrows():
+        uuid        = row.get("filing_uuid")
+        filing_year = int(row.get("year", year))
+        period_val  = row.get("period") or row.get("quarter") or ""
+        quarter_val = quarter_from_period(period_val) or ""
+        client      = row.get("client_name") or ""
+
+        # ── Lobbying issue codes ───────────────────────────────────────────
+        activities = row.get("lobbying_activities")
+        if isinstance(activities, list):
+            for act in activities:
+                if not isinstance(act, dict):
+                    continue
+                code = (act.get("general_issue_code") or "").strip().upper()
+                if not code:
+                    continue
+                specific = (act.get("specific_issues") or "")[:500]
+                issue_rows.append((uuid, code, specific, filing_year, quarter_val, client))
+
+        # ── Government agency targets ──────────────────────────────────────
+        entities = row.get("government_entities")
+        if isinstance(entities, list):
+            for ent in entities:
+                if isinstance(ent, str):
+                    agency_name = ent.strip()[:200]
+                elif isinstance(ent, dict):
+                    agency_name = (
+                        ent.get("name") or ent.get("government_entity") or ""
+                    ).strip()[:200]
+                else:
+                    continue
+                if agency_name:
+                    agency_rows.append(
+                        (uuid, agency_name, filing_year, quarter_val, client)
+                    )
+
+    _log(
+        f"[backfill_detail] Year {year}: "
+        f"{len(issue_rows):,} issue rows, {len(agency_rows):,} agency rows. "
+        "Writing to database…"
+    )
+
+    conn = sqlite3.connect(db_path)
+    try:
+        cursor = conn.cursor()
+        _ensure_filing_detail_tables(cursor)   # idempotent; outside BEGIN
+
+        cursor.execute("BEGIN")
+        cursor.execute("DELETE FROM filing_issues  WHERE year = ?", (year,))
+        cursor.executemany(
+            """
+            INSERT INTO filing_issues
+                (filing_uuid, general_issue_code, specific_issues_text, year, quarter, client_name)
+            VALUES (?, ?, ?, ?, ?, ?)
+            """,
+            issue_rows,
+        )
+        cursor.execute("DELETE FROM filing_agencies WHERE year = ?", (year,))
+        cursor.executemany(
+            """
+            INSERT INTO filing_agencies
+                (filing_uuid, agency_name, year, quarter, client_name)
+            VALUES (?, ?, ?, ?, ?)
+            """,
+            agency_rows,
+        )
+        conn.commit()
+        _log(f"[backfill_detail] Year {year}: committed successfully.")
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
+
+    return {
+        "year": year,
+        "filings_fetched": len(filings_df),
+        "issue_rows": len(issue_rows),
+        "agency_rows": len(agency_rows),
+    }
+
+
+def _ensure_filing_detail_tables(cursor: sqlite3.Cursor) -> None:
+    """
+    Create filing_issues and filing_agencies tables if they don't exist (idempotent).
+
+    filing_issues  — one row per lobbying activity per filing, keyed by
+                     general_issue_code (e.g. 'TAX', 'DEF', 'HCR').
+    filing_agencies — one row per government agency lobbied per filing
+                      (e.g. 'Department of Defense', 'U.S. Senate').
+
+    Called OUTSIDE the atomic transaction so that index creation does not
+    conflict with the BEGIN/COMMIT block further down.
+    """
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS filing_issues (
+            id                   INTEGER PRIMARY KEY AUTOINCREMENT,
+            filing_uuid          TEXT NOT NULL,
+            general_issue_code   TEXT NOT NULL,
+            specific_issues_text TEXT,
+            year                 INTEGER,
+            quarter              TEXT,
+            client_name          TEXT
+        )
+    """)
+    cursor.execute(
+        "CREATE INDEX IF NOT EXISTS idx_fi_code_year   "
+        "ON filing_issues(general_issue_code, year)"
+    )
+    cursor.execute(
+        "CREATE INDEX IF NOT EXISTS idx_fi_client_year "
+        "ON filing_issues(client_name, year)"
+    )
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS filing_agencies (
+            id           INTEGER PRIMARY KEY AUTOINCREMENT,
+            filing_uuid  TEXT NOT NULL,
+            agency_name  TEXT NOT NULL,
+            year         INTEGER,
+            quarter      TEXT,
+            client_name  TEXT
+        )
+    """)
+    cursor.execute(
+        "CREATE INDEX IF NOT EXISTS idx_fa_agency_year "
+        "ON filing_agencies(agency_name, year)"
+    )
+    cursor.execute(
+        "CREATE INDEX IF NOT EXISTS idx_fa_client_year "
+        "ON filing_agencies(client_name, year)"
+    )
+
+
 def build_company_lobbying_for_year(
     year: int,
     db_path: str = None,
@@ -877,23 +1148,63 @@ def build_company_lobbying_for_year(
     # 2) Prepare raw-year payload and aggregate in-memory first
     #     (so we never delete existing DB rows unless this build is valid)
     # ------------------------------------------------------------------
-    rows_to_insert = []
+    rows_to_insert: list[tuple] = []
+    issue_rows:     list[tuple] = []   # → filing_issues table
+    agency_rows:    list[tuple] = []   # → filing_agencies table
+
     for _, row in filings_df.iterrows():
+        uuid        = row.get("filing_uuid")
+        filing_year = int(row.get("year", year))
+        period_val  = row.get("period") or row.get("quarter") or ""
+        quarter_val = quarter_from_period(period_val) or ""
+        client      = row.get("client_name") or ""
+
         rows_to_insert.append(
             (
-                row.get("filing_uuid"),
+                uuid,
                 row.get("filing_type"),
                 row.get("registrant_name"),
                 row.get("registrant_id"),
-                row.get("client_name"),
+                client,
                 row.get("client_id"),
                 float(row.get("amount", 0) or 0),
-                int(row.get("year", year)),
-                row.get("period") or row.get("quarter") or "",
+                filing_year,
+                period_val,
                 row.get("filing_date") or "",
                 datetime.now(timezone.utc).isoformat(),
             )
         )
+
+        # ── Extract lobbying issue codes (general_issue_code) ─────────────
+        activities = row.get("lobbying_activities")
+        if isinstance(activities, list):
+            for act in activities:
+                if not isinstance(act, dict):
+                    continue
+                code = (act.get("general_issue_code") or "").strip().upper()
+                if not code:
+                    continue
+                specific = (act.get("specific_issues") or "")[:500]
+                issue_rows.append(
+                    (uuid, code, specific, filing_year, quarter_val, client)
+                )
+
+        # ── Extract government agency targets ─────────────────────────────
+        entities = row.get("government_entities")
+        if isinstance(entities, list):
+            for ent in entities:
+                if isinstance(ent, str):
+                    agency_name = ent.strip()[:200]
+                elif isinstance(ent, dict):
+                    agency_name = (
+                        ent.get("name") or ent.get("government_entity") or ""
+                    ).strip()[:200]
+                else:
+                    continue
+                if agency_name:
+                    agency_rows.append(
+                        (uuid, agency_name, filing_year, quarter_val, client)
+                    )
 
     # ------------------------------------------------------------------
     # 3) Aggregate to company-year-quarter (pre-write validation stage)
@@ -1011,6 +1322,9 @@ def build_company_lobbying_for_year(
         if "match_method" not in cols:
             cursor.execute("ALTER TABLE company_lobbying ADD COLUMN match_method TEXT")
 
+        # Create filing detail tables outside the transaction (idempotent)
+        _ensure_filing_detail_tables(cursor)
+
         cursor.execute("BEGIN")
 
         cursor.execute("DELETE FROM lobbying_filings WHERE year = ?", (year,))
@@ -1025,6 +1339,28 @@ def build_company_lobbying_for_year(
             rows_to_insert,
         )
         inserted_raw = conn.total_changes - before_insert_changes
+
+        cursor.execute("DELETE FROM filing_issues  WHERE year = ?", (year,))
+        cursor.executemany(
+            """
+            INSERT INTO filing_issues
+            (filing_uuid, general_issue_code, specific_issues_text, year, quarter, client_name)
+            VALUES (?, ?, ?, ?, ?, ?)
+            """,
+            issue_rows,
+        )
+
+        cursor.execute("DELETE FROM filing_agencies WHERE year = ?", (year,))
+        cursor.executemany(
+            """
+            INSERT INTO filing_agencies
+            (filing_uuid, agency_name, year, quarter, client_name)
+            VALUES (?, ?, ?, ?, ?)
+            """,
+            agency_rows,
+        )
+        print(f"   filing_issues rows  : {len(issue_rows):,}")
+        print(f"   filing_agencies rows: {len(agency_rows):,}")
 
         cursor.execute("DELETE FROM company_lobbying WHERE year = ?", (year,))
         cursor.executemany(

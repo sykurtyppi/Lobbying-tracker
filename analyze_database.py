@@ -370,6 +370,105 @@ def analyze_database(db_path="data/lobbying_data.db"):
         if min_date and max_date:
             print(f"  📅 Filing date range: {min_date} to {max_date}")
 
+        # 5b. Filing detail tables (issue codes + agency targets)
+        print("\n\n📋 FILING DETAIL TABLES (filing_issues / filing_agencies)")
+        print("-"*70)
+
+        fi_exists = not pd.read_sql_query(
+            "SELECT name FROM sqlite_master WHERE type='table' AND name='filing_issues'",
+            conn,
+        ).empty
+        fa_exists = not pd.read_sql_query(
+            "SELECT name FROM sqlite_master WHERE type='table' AND name='filing_agencies'",
+            conn,
+        ).empty
+
+        if not fi_exists and not fa_exists:
+            print("  ⚠️  Neither filing_issues nor filing_agencies tables exist yet.")
+            print("       Run a full data refresh to populate them.")
+        else:
+            if fi_exists:
+                fi_summary = pd.read_sql_query(
+                    """
+                    SELECT
+                        year,
+                        COUNT(*) AS n_rows,
+                        COUNT(DISTINCT general_issue_code) AS unique_codes,
+                        COUNT(DISTINCT client_name) AS unique_clients
+                    FROM filing_issues
+                    GROUP BY year
+                    ORDER BY year DESC
+                    """,
+                    conn,
+                )
+                if fi_summary.empty:
+                    print("  ⚠️  filing_issues table exists but is empty — run a data refresh.")
+                else:
+                    print("\n  filing_issues rows by year:")
+                    for _, row in fi_summary.iterrows():
+                        yr = _fmt_year(row["year"])
+                        print(
+                            f"    {yr}: {int(row['n_rows']):>8,} rows, "
+                            f"{int(row['unique_codes']):>3,} issue codes, "
+                            f"{int(row['unique_clients']):>5,} clients"
+                        )
+                    # Top 10 issue codes overall
+                    top_codes = pd.read_sql_query(
+                        """
+                        SELECT general_issue_code, COUNT(*) AS n
+                        FROM filing_issues
+                        GROUP BY general_issue_code
+                        ORDER BY n DESC
+                        LIMIT 10
+                        """,
+                        conn,
+                    )
+                    print("\n  Top 10 issue codes (all years):")
+                    for _, row in top_codes.iterrows():
+                        print(f"    {row['general_issue_code']:<6s}: {int(row['n']):>8,}")
+            else:
+                print("  ⚠️  filing_issues table missing — run a data refresh.")
+
+            if fa_exists:
+                fa_summary = pd.read_sql_query(
+                    """
+                    SELECT
+                        year,
+                        COUNT(*) AS n_rows,
+                        COUNT(DISTINCT agency_name) AS unique_agencies
+                    FROM filing_agencies
+                    GROUP BY year
+                    ORDER BY year DESC
+                    """,
+                    conn,
+                )
+                if fa_summary.empty:
+                    print("  ⚠️  filing_agencies table exists but is empty — run a data refresh.")
+                else:
+                    print("\n  filing_agencies rows by year:")
+                    for _, row in fa_summary.iterrows():
+                        yr = _fmt_year(row["year"])
+                        print(
+                            f"    {yr}: {int(row['n_rows']):>8,} rows, "
+                            f"{int(row['unique_agencies']):>4,} unique agencies"
+                        )
+                    # Top 10 targeted agencies overall
+                    top_agencies = pd.read_sql_query(
+                        """
+                        SELECT agency_name, COUNT(*) AS n
+                        FROM filing_agencies
+                        GROUP BY agency_name
+                        ORDER BY n DESC
+                        LIMIT 10
+                        """,
+                        conn,
+                    )
+                    print("\n  Top 10 targeted agencies (all years):")
+                    for _, row in top_agencies.iterrows():
+                        print(f"    {row['agency_name'][:50]:<50s}: {int(row['n']):>7,}")
+            else:
+                print("  ⚠️  filing_agencies table missing — run a data refresh.")
+
         # 6. Summary recommendations
         print("\n\n💡 RECOMMENDATIONS")
         print("-"*70)

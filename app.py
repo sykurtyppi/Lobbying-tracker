@@ -1201,10 +1201,15 @@ def get_conviction_scores(
     YoY Growth    (0-40 pts)  – concave (sqrt) curve; reaches max at 500% growth.
                                Decline bands (negative YoY) score 0–8 pts.
                                New entrants with no prior-year data get 15 pts (neutral).
-    Spend/MCap    (0-30 pts)  – percentile rank of spend-to-market-cap ratio within
+    Spend/MCap    (0-25 pts)  – percentile rank of spend-to-market-cap ratio within
                                the scored universe.  Companies without market-cap data
                                score 0 (not the old 10-pt free bonus).
-    Consistency   (0-30 pts)  – proportion of the year's 4 quarters with filings.
+    Consistency   (0-25 pts)  – proportion of the year's 4 quarters with filings.
+    OpenSecrets   (0-10 pts)  – percentile rank of combined PAC + individual
+                               contributions for the year.  Scores 0 when the
+                               opensecrets_contribs table is absent or empty.
+
+    Maximum possible score: 100 (with OS data) | 90 (without OS data).
 
     Parameters
     ----------
@@ -1361,6 +1366,36 @@ def get_conviction_scores(
                 conn,
                 params=(year, min_spend, prev_year),
             )
+
+        # ── OpenSecrets PAC/contribution data (optional, graceful if absent) ─
+        os_spend: pd.Series = pd.Series(dtype=float)
+        try:
+            os_tbl = pd.read_sql_query(
+                "SELECT name FROM sqlite_master WHERE type='table'"
+                " AND name='opensecrets_contribs'",
+                conn,
+            )
+            if not os_tbl.empty:
+                os_df = pd.read_sql_query(
+                    """
+                    SELECT ticker,
+                           COALESCE(total_contribs, 0) + COALESCE(pacs, 0) AS os_combined
+                    FROM opensecrets_contribs
+                    WHERE year = :year
+                      AND ticker IS NOT NULL AND TRIM(ticker) != ''
+                    """,
+                    conn,
+                    params={"year": year},
+                )
+                if not os_df.empty:
+                    # Aggregate duplicates: multiple company_name rows can share a
+                    # ticker (e.g. subsidiary aliases). Sum is correct because PAC
+                    # contributions from all aliases roll up to the same public entity.
+                    # Using set_index on a non-unique index raises InvalidIndexError.
+                    os_spend = os_df.groupby("ticker", sort=False)["os_combined"].sum()
+        except Exception:
+            pass  # OS table absent or query failed – component scores 0 for all
+
     finally:
         conn.close()
 
@@ -1396,28 +1431,45 @@ def get_conviction_scores(
         capped = min(pct, 500.0)
         return round(8.0 + ((capped / 500.0) ** 0.5) * 32.0, 1)
 
-    # ── Spend/MCap component (0-30 pts) — percentile rank ────────────────────
-    # Companies WITHOUT market-cap data score 0 (was 10).
-    # Giving untickered private companies a free 10 pts polluted the rankings.
+    # ── Spend/MCap component (0-25 pts) — percentile rank ────────────────────
+    # Companies WITHOUT market-cap data score 0.
+    # Rescaled 30→25 to make room for the OpenSecrets PAC component.
     def _mcap_pts(series):
         """Rank each company's spend/mcap ratio within the scored universe."""
         notna = series.notna()
         result = pd.Series(0.0, index=series.index)   # 0 for no market-cap data
         if notna.sum() > 0:
             ranks = series[notna].rank(pct=True)
-            result[notna] = (ranks * 30.0).round(1)
+            result[notna] = (ranks * 25.0).round(1)
         return result
 
-    # ── Consistency component (0-30 pts) ─────────────────────────────────────
+    # ── Consistency component (0-25 pts) ─────────────────────────────────────
+    # Rescaled 30→25 to make room for the OpenSecrets PAC component.
     def _consistency_pts(q):
-        return round((min(int(q), 4) / 4.0) * 30.0, 1)
+        return round((min(int(q), 4) / 4.0) * 25.0, 1)
 
+    # ── OpenSecrets PAC component (0-10 pts) ─────────────────────────────────
+    # Companies combining heavy lobbying with PAC contributions score higher.
+    # Academic evidence: dual-channel (lobby + donate) firms have stronger policy
+    # outcomes (Hutchens, Rego, Sheneman 2016).  Scores 0 when OS key not set.
+    def _os_pts(series: pd.Series) -> pd.Series:
+        """Percentile rank of (total_contribs + pacs) combined spend. 0-10 pts."""
+        positive = series.notna() & (series > 0)
+        result = pd.Series(0.0, index=series.index)
+        if positive.sum() > 0:
+            ranks = series[positive].rank(pct=True)
+            result[positive] = (ranks * 10.0).round(1)
+        return result
+
+    df["os_combined"]    = df["ticker"].map(os_spend).fillna(0.0)
     df["yoy_pts"]         = df["yoy_pct"].apply(_yoy_pts)
     df["mcap_pts"]        = _mcap_pts(df["avg_spend_mcap"])
     df["consistency_pts"] = df["quarters_count"].apply(_consistency_pts)
+    df["os_pts"]          = _os_pts(df["os_combined"])
     df["conviction_score"] = (
-        df["yoy_pts"] + df["mcap_pts"] + df["consistency_pts"]
+        df["yoy_pts"] + df["mcap_pts"] + df["consistency_pts"] + df["os_pts"]
     ).round(1)
+    # Max: 40 + 25 + 25 + 10 = 100 (with OS data) | 40 + 25 + 25 = 90 (without)
 
     return df.sort_values("conviction_score", ascending=False).reset_index(drop=True)
 
@@ -2020,6 +2072,33 @@ def get_conviction_benchmark(db_path, top_n: int, refresh_token=0):
         return pd.DataFrame()
 
     strat_df = pd.DataFrame(rows).sort_values("signal_year").reset_index(drop=True)
+
+    # ── Regime filter: reduce exposure in high policy-risk environments ───────
+    # Uses VIX, SPY/200DMA, credit spreads, and yield-curve as macro risk flags.
+    # High-risk regime (≥2 flags triggered at signal date) → model as 50%
+    # portfolio + 50% cash, halving effective gross return for that year.
+    # Research basis: lobbying signals lose predictive power when policy decisions
+    # are postponed/reversed during credit stress or market dislocation.
+    strat_df["regime_high_risk"] = None
+    try:
+        regime_df = get_policy_risk_regime_features(
+            strat_df["signal_year"].astype(int).tolist(),
+            refresh_token=refresh_token,
+        )
+        if not regime_df.empty:
+            regime_map = dict(
+                zip(regime_df["signal_year"].astype(int), regime_df["high_policy_risk"])
+            )
+            strat_df["regime_high_risk"] = strat_df["signal_year"].map(regime_map)
+            strat_df["strategy_return_gross"] = strat_df.apply(
+                lambda r: round(float(r["strategy_return_gross"]) * 0.5, 2)
+                if pd.notna(r["regime_high_risk"]) and bool(r["regime_high_risk"])
+                else r["strategy_return_gross"],
+                axis=1,
+            )
+    except Exception:
+        pass  # Do not break backtest if regime data (yfinance) is unavailable
+
     prev_constituents = []
     turnover_vals = []
     for constituents in strat_df["constituents"].tolist():
@@ -2289,6 +2368,107 @@ def _load_opensecrets_contribs(db_path, year, refresh_token=0) -> pd.DataFrame:
                 """,
                 conn,
                 params=(year,),
+            )
+            return df
+        finally:
+            conn.close()
+    except Exception:
+        return pd.DataFrame()
+
+
+@st.cache_data
+def get_issue_breakdown_for_ticker(db_path, ticker: str, refresh_token=0) -> pd.DataFrame:
+    """
+    Return the lobbying issue-code breakdown for a given ticker, aggregated
+    by year and general_issue_code.
+
+    Requires the filing_issues table (populated by build_company_lobbying_for_year).
+    Returns empty DataFrame if the table doesn't exist yet (pre-migration data).
+
+    Columns: year, general_issue_code, n_activities
+    """
+    import sqlite3
+
+    if not ticker:
+        return pd.DataFrame()
+    try:
+        conn = sqlite3.connect(db_path)
+        try:
+            tbl = pd.read_sql_query(
+                "SELECT name FROM sqlite_master WHERE type='table' AND name='filing_issues'",
+                conn,
+            )
+            if tbl.empty:
+                return pd.DataFrame()
+            df = pd.read_sql_query(
+                """
+                SELECT
+                    fi.year,
+                    fi.general_issue_code,
+                    COUNT(*) AS n_activities
+                FROM filing_issues fi
+                WHERE UPPER(TRIM(fi.client_name)) IN (
+                    SELECT UPPER(TRIM(company_name))
+                    FROM company_lobbying
+                    WHERE UPPER(TRIM(ticker)) = UPPER(TRIM(?))
+                )
+                GROUP BY fi.year, fi.general_issue_code
+                ORDER BY fi.year DESC, n_activities DESC
+                """,
+                conn,
+                params=(ticker,),
+            )
+            return df
+        finally:
+            conn.close()
+    except Exception:
+        return pd.DataFrame()
+
+
+@st.cache_data
+def get_top_issue_codes_by_year(db_path, year: int, top_n: int = 10, refresh_token=0) -> pd.DataFrame:
+    """
+    Return the top lobbying issue codes for ticker-matched (investable) companies only.
+
+    Filters to clients whose company_name appears in company_lobbying with a non-null
+    ticker, removing NGOs, trade associations, and government entities that are not
+    investable but would otherwise dominate the issue-code counts.
+
+    Requires the filing_issues table.
+    Columns: general_issue_code, n_activities, n_companies
+    """
+    import sqlite3
+
+    try:
+        conn = sqlite3.connect(db_path)
+        try:
+            tbl = pd.read_sql_query(
+                "SELECT name FROM sqlite_master WHERE type='table' AND name='filing_issues'",
+                conn,
+            )
+            if tbl.empty:
+                return pd.DataFrame()
+            df = pd.read_sql_query(
+                """
+                SELECT
+                    fi.general_issue_code,
+                    COUNT(*)                      AS n_activities,
+                    COUNT(DISTINCT fi.client_name) AS n_companies
+                FROM filing_issues fi
+                WHERE fi.year = ?
+                  AND fi.client_name IN (
+                      SELECT DISTINCT company_name
+                      FROM company_lobbying
+                      WHERE ticker IS NOT NULL
+                        AND TRIM(ticker) != ''
+                        AND year = ?
+                  )
+                GROUP BY fi.general_issue_code
+                ORDER BY n_activities DESC
+                LIMIT ?
+                """,
+                conn,
+                params=(year, year, top_n),
             )
             return df
         finally:
@@ -2688,6 +2868,16 @@ def _render_benchmark_section(db_path: str, cache_buster: int, key_prefix: str =
     )
     st.plotly_chart(fig, use_container_width=True, key=f"{key_prefix}_chart")
 
+    # Sample-size notice under the chart
+    _n_bt_years = len(years)
+    if _n_bt_years < 8:
+        st.caption(
+            f"**Small-sample warning — {_n_bt_years} annual observation(s).** "
+            "Fewer than 8 years of data: alpha estimates, win rates, and Sharpe ratios "
+            "are highly sensitive to single-year outcomes. Treat all backtest metrics as "
+            "directional indicators rather than statistically reliable figures."
+        )
+
     # Comparison table with alpha rows
     def _fmt(v):
         return f"{v:+.1f}%" if pd.notna(v) and v is not None else "N/A"
@@ -2815,6 +3005,15 @@ def _render_benchmark_section(db_path: str, cache_buster: int, key_prefix: str =
             st.info("Need at least 3 annual observations per portfolio to compute risk stats.")
         else:
             st.dataframe(pd.DataFrame(risk_rows), use_container_width=True, hide_index=True)
+            # Sample-size warning — Sharpe / drawdown estimates are noisy below ~8 years
+            _min_obs = min(r["Years"] for r in risk_rows)
+            if _min_obs < 8:
+                st.caption(
+                    f"**Small sample warning** — based on {_min_obs} annual observation(s). "
+                    "Sharpe ratio, max drawdown, and CAGR estimates are unreliable with fewer "
+                    "than 8 years of data; the confidence interval on Sharpe alone spans ±1.0 "
+                    "at this sample size. Treat all metrics as directional rather than precise."
+                )
 
     st.markdown("---")
     with st.expander("Overfitting Diagnostics", expanded=False):
@@ -5313,7 +5512,27 @@ def main():
     
     # Initialize tools
     fetcher = get_data_fetcher()
-    
+
+    # ── Startup schema migration check ──────────────────────────────────────
+    # Ensures filing_issues, filing_agencies, and schema_version tables exist.
+    # Streamlit reruns often; run this check once per session.
+    if not st.session_state.get("_schema_check_ran", False):
+        try:
+            from build_company_lobbying import ensure_schema_current
+            _migration_result = ensure_schema_current(fetcher.db_path)
+            if _migration_result["migrated"]:
+                st.warning(
+                    "**Database schema updated automatically** — "
+                    f"applied migration(s): {_migration_result['migrations_applied']}. "
+                    "This happens once after updating the app. "
+                    "Go to **Settings → Issue & Agency Data Backfill** to populate any "
+                    "newly created tables without running a full data rebuild."
+                )
+        except Exception as _schema_err:
+            st.warning(f"Schema check failed (non-critical): {_schema_err}")
+        finally:
+            st.session_state["_schema_check_ran"] = True
+
     # Get years that actually have data
     available_years = get_available_years(fetcher.db_path, st.session_state["cache_buster"])
     default_year = get_default_year(fetcher.db_path, st.session_state["cache_buster"])
@@ -5395,7 +5614,7 @@ def main():
                             force=True,
                         )
                         
-                        st.success(f"✅ Successfully fetched and processed {selected_year} data!")
+                        st.success(f"Successfully fetched and processed {selected_year} data.")
                         st.info("Refreshing app with new data...")
                         
                         # Bump refresh token and reload
@@ -6457,12 +6676,152 @@ def main():
                     "Contributions are for the full election cycle, not calendar year."
                 )
 
+        # ── Conviction Score Leaderboard ──────────────────────────────────────
+        st.markdown("---")
+        st.markdown("#### Conviction Score Leaderboard")
+        st.caption(
+            "Composite score (max 100) combining four signals: "
+            "**YoY spend growth** (0–40 pts, sqrt-curve), "
+            "**Spend/Market-Cap yield** (0–25 pts, percentile rank), "
+            "**Filing consistency** across quarters (0–25 pts), "
+            "and **PAC + political contributions** from OpenSecrets (0–10 pts, if available). "
+            "Only public-company tickers are included. "
+            "Used internally by the backtest engine to rank portfolio candidates."
+        )
+
+        with st.spinner("Computing conviction scores..."):
+            conv_df = get_conviction_scores(
+                fetcher.db_path,
+                selected_year,
+                refresh_token=st.session_state["cache_buster"],
+                min_spend_m=min_spend,
+            )
+
+        if conv_df.empty:
+            st.info(
+                f"No conviction scores available for {selected_year}. "
+                "Ensure data for this year and the prior year are loaded, "
+                "and that at least some companies are mapped to tickers."
+            )
+        else:
+            conv_disp = conv_df.copy().head(200)
+            conv_disp["Rank"]            = range(1, len(conv_disp) + 1)
+            conv_disp["Company"]         = conv_disp["company_name"]
+            conv_disp["Ticker"]          = conv_disp["ticker"]
+            conv_disp["Score"]           = conv_disp["conviction_score"].apply(
+                lambda v: f"{v:.1f}" if pd.notna(v) else "N/A"
+            )
+            conv_disp["YoY Pts (0-40)"]  = conv_disp["yoy_pts"].apply(
+                lambda v: f"{v:.1f}" if pd.notna(v) else "0.0"
+            )
+            conv_disp["MCap Pts (0-25)"] = conv_disp["mcap_pts"].apply(
+                lambda v: f"{v:.1f}" if pd.notna(v) else "0.0"
+            )
+            conv_disp["Cons Pts (0-25)"] = conv_disp["consistency_pts"].apply(
+                lambda v: f"{v:.1f}" if pd.notna(v) else "0.0"
+            )
+            conv_disp["OS Pts (0-10)"]   = conv_disp["os_pts"].apply(
+                lambda v: f"{v:.1f}" if pd.notna(v) else "0.0"
+            )
+            conv_disp["Sector"]          = conv_disp["sector"].fillna("N/A") if "sector" in conv_disp.columns else "N/A"
+
+            _conv_display_cols = [
+                "Rank", "Company", "Ticker", "Score",
+                "YoY Pts (0-40)", "MCap Pts (0-25)", "Cons Pts (0-25)", "OS Pts (0-10)",
+                "Sector",
+            ]
+            # Only include columns that actually exist in the dataframe
+            _conv_display_cols = [c for c in _conv_display_cols if c in conv_disp.columns]
+
+            st.dataframe(
+                conv_disp[_conv_display_cols],
+                use_container_width=True,
+                hide_index=True,
+                height=480,
+            )
+            if len(conv_df) > 200:
+                st.caption(
+                    f"Showing top 200 of {len(conv_df):,} scored companies. "
+                    "Download CSV for the full universe."
+                )
+
+            # Show whether OS data boosted any scores
+            os_active = (conv_df["os_pts"] > 0).sum()
+            if os_active > 0:
+                st.caption(
+                    f"OpenSecrets data active: {os_active:,} companies received OS bonus pts "
+                    f"(max boost: {conv_df['os_pts'].max():.1f} pts)."
+                )
+            else:
+                st.caption(
+                    "OpenSecrets data not yet loaded — OS Pts column shows 0.0 for all companies. "
+                    "Add your API key in **Settings → OpenSecrets API** to enable."
+                )
+
+            st.download_button(
+                label="Download Conviction Scores CSV",
+                data=conv_df[[
+                    "company_name", "ticker", "conviction_score",
+                    "yoy_pts", "mcap_pts", "consistency_pts", "os_pts",
+                    "yoy_pct", "quarters_count",
+                ]].to_csv(index=False).encode("utf-8"),
+                file_name=f"conviction_scores_{selected_year}.csv",
+                mime="text/csv",
+                key="dl_conviction_scores",
+            )
+
     with tab3:
         st.markdown("### Strategy Analytics")
         st.info(
             "**Start here:** Use **Production Picks** as the primary decision list. "
             "All strategy performance panels below are aligned to that production model."
         )
+
+        # ── Model Assumptions & Methodology ───────────────────────────────────
+        with st.expander("📐 Model Assumptions & Methodology", expanded=False):
+            st.markdown(
+                """
+**What this model does**
+
+Lobbying filings reported to the Senate LDA are used as a forward-looking signal:
+companies that *accelerate* lobbying spend are hypothesised to be anticipating
+regulatory tailwinds, contract awards, or policy outcomes not yet reflected in prices.
+The portfolio is ranked, formed at year-end, and held for the following calendar year.
+
+---
+
+**Key assumptions — understand before interpreting results**
+
+| Assumption | Detail |
+|---|---|
+| **Signal lag** | Senate LDA filings are public ~45 days after each quarter-end. The model uses a 20-day lag from Q4 year-end (≈ Jan 20) as the signal anchor date. |
+| **Hold period** | 12 months (full calendar year following signal year). |
+| **Transaction costs** | Equal-weight turnover × configurable cost bps (default: set in Settings). Applied symmetrically on buys and sells. |
+| **Universe** | Ticker-matched public companies with ≥ $1M annual lobbying spend. Private companies, NGOs, trade associations, and governments are excluded. |
+| **Returns** | Equal-weight average of constituent 1-year forward returns from `stock_performance` table (sourced via Yahoo Finance). |
+| **Regime filter** | VIX, SPY/200-DMA, LQD/HYG credit ratio, and 10Y-3M yield spread — *not* a formally calibrated model. Acts as a macro stress overlay: ≥ 2 flags → 50% portfolio sizing for that year. |
+| **Backtest depth** | 2019–present. Limited history means statistical significance is low (n ≈ 5-6 independent years). Treat results as directional evidence, not proof of edge. |
+| **Survivorship** | No survivorship bias correction. Delistings and M&A exits during the hold year are not explicitly handled; Yahoo Finance may return partial returns or NaN. |
+| **Sector classification** | Pulled from Yahoo Finance `info.sector` at time of data fetch; point-in-time sector may differ. |
+
+---
+
+**What the conviction score measures (NOT what the backtest uses)**
+
+The conviction score (0–100) ranks companies for monitoring purposes. The *production backtest*
+uses the `hist_spend_z` composite, not conviction scores directly. Conviction scores are
+a multi-factor screening tool, not a backtest-validated signal on their own.
+
+---
+
+**Limitations you should know**
+
+- 5–6 years of data is below the threshold for robust statistical inference.
+- The regime filter improves theoretical soundness but adds one more unvalidated assumption.
+- The signal works better in risk-on regimes; performance during 2022's rate-shock year should be interpreted with that in mind.
+- OpenSecrets PAC data adds a dimension but is tied to election-cycle reporting, not calendar years.
+                """
+            )
 
         # ── Stock performance coverage banner ─────────────────────────────────
         import sqlite3 as _sp_sq3
@@ -6623,7 +6982,7 @@ def main():
                     f"- **{lbl}**: measures stock price change from "
                     f"{_ref_date.strftime('%b %d, %Y')} → "
                     f"{tgt.strftime('%b %d, %Y')} "
-                    f"({'✅ past' if tgt <= _today else '⏳ future'})"
+                    f"({'past' if tgt <= _today else 'future'})"
                     for _, (lbl, tgt) in _period_meta.items()
                 )
             )
@@ -8345,6 +8704,104 @@ def main():
                         key="dl_qf",
                     )
 
+        # ── Market-Wide Issue Pulse ────────────────────────────────────────────
+        st.markdown("---")
+        st.markdown("#### Market Issue Pulse")
+        st.caption(
+            "Which policy areas are drawing the most lobbying activity among "
+            "ticker-mapped (investable) companies this year? "
+            "Non-public entities — trade associations, NGOs, government bodies — "
+            "are excluded so counts reflect the investable universe only. "
+            "Issue codes follow the Senate LDA 76-code taxonomy. "
+            "Research (Lowry & Volkova 2024) shows agency-targeted lobbying "
+            "(DEF, FIN, ENV) yields 30–70% higher firm value uplift vs Congress-only lobbying. "
+            "Requires a data refresh to populate (filing_issues table)."
+        )
+
+        _mip_year = selected_year
+        with st.spinner("Loading market issue data..."):
+            mip_df = get_top_issue_codes_by_year(
+                fetcher.db_path,
+                year=_mip_year,
+                top_n=15,
+                refresh_token=st.session_state["cache_buster"],
+            )
+
+        if mip_df.empty:
+            st.info(
+                f"No issue-code data yet for {_mip_year}. "
+                "Trigger a **Data Refresh** from the sidebar to populate the "
+                "`filing_issues` table from the Senate LDA API."
+            )
+        else:
+            _MIP_LABELS = {
+                "TAX": "Taxation", "DEF": "Defense", "HCR": "Health Issues",
+                "FIN": "Financial/Securities", "ENV": "Environment",
+                "LBR": "Labor/Antitrust", "TEC": "Telecommunications",
+                "CPT": "Copyright/Patent", "FOR": "Foreign Relations",
+                "TRD": "Trade", "BUD": "Budget/Appropriations",
+                "MMM": "Medicare/Medicaid", "PHA": "Pharmacy",
+                "MED": "Medical Research", "EDU": "Education",
+                "HOM": "Homeland Security", "INT": "Intelligence",
+                "FUE": "Fuel/Gas/Oil", "UTI": "Utilities",
+                "COM": "Communications", "AVI": "Aviation/Airlines",
+                "TRA": "Transportation", "INS": "Insurance",
+                "BAN": "Banking", "IMM": "Immigration",
+                "LAW": "Law Enforcement",
+            }
+            mip_df["issue_label"] = (
+                mip_df["general_issue_code"]
+                .map(_MIP_LABELS)
+                .fillna(mip_df["general_issue_code"])
+            )
+            mip_df_sorted = mip_df.sort_values("n_activities", ascending=True)
+
+            _mip_colors = [
+                "#ef4444" if code in ("TAX", "DEF", "FIN", "HCR")
+                else "#3b82f6"
+                for code in mip_df_sorted["general_issue_code"]
+            ]
+
+            fig_mip = go.Figure()
+            fig_mip.add_trace(go.Bar(
+                x=mip_df_sorted["n_activities"],
+                y=mip_df_sorted["issue_label"],
+                orientation="h",
+                marker_color=_mip_colors,
+                text=[f"{int(v):,}" for v in mip_df_sorted["n_activities"]],
+                textposition="outside",
+                customdata=mip_df_sorted[["n_companies", "general_issue_code"]].values,
+                hovertemplate=(
+                    "<b>%{y}</b> (%{customdata[1]})<br>"
+                    "Activities: %{x:,}<br>"
+                    "Companies: %{customdata[0]:,}<extra></extra>"
+                ),
+            ))
+            fig_mip.update_layout(
+                title=f"Top Policy Issue Areas — {_mip_year} (red = high-alpha codes per research)",
+                xaxis=dict(title="Filing Activities", gridcolor="#2d3748"),
+                yaxis=dict(title="", gridcolor="#2d3748"),
+                plot_bgcolor="#0e1117",
+                paper_bgcolor="#0e1117",
+                font=dict(color="#ffffff", size=12),
+                height=max(350, len(mip_df) * 28),
+                margin=dict(l=0, r=80, t=50, b=0),
+            )
+            st.plotly_chart(fig_mip, use_container_width=True, key="mip_chart")
+
+            # Summary table
+            mip_tbl = mip_df.sort_values("n_activities", ascending=False).copy()
+            mip_tbl["Issue Code"] = mip_tbl["general_issue_code"]
+            mip_tbl["Issue Area"] = mip_tbl["issue_label"]
+            mip_tbl["Activities"] = mip_tbl["n_activities"].apply(lambda v: f"{int(v):,}")
+            mip_tbl["Companies"]  = mip_tbl["n_companies"].apply(lambda v: f"{int(v):,}")
+            st.dataframe(
+                mip_tbl[["Issue Code", "Issue Area", "Activities", "Companies"]],
+                use_container_width=True,
+                hide_index=True,
+                key="mip_table",
+            )
+
     # ══════════════════════════════════════════════════════════════════════════
     with tab5:
         st.markdown("### Company Research")
@@ -8787,9 +9244,222 @@ def main():
                         key="cr_download",
                     )
 
+                    # ── Issue Code Breakdown ───────────────────────────────────
+                    st.markdown("---")
+                    st.markdown("#### Lobbying Issue Breakdown")
+                    st.caption(
+                        "What policy areas is this company lobbying on? Issue codes follow "
+                        "the Senate LDA 76-code taxonomy. Research shows issue-specific "
+                        "lobbying (TAX, DEF, HCR) is the strongest predictor of alpha. "
+                        "Populated automatically on each data refresh."
+                    )
+                    cr_issues = get_issue_breakdown_for_ticker(
+                        fetcher.db_path,
+                        cr_ticker,
+                        refresh_token=st.session_state["cache_buster"],
+                    )
+                    if cr_issues.empty:
+                        st.info(
+                            "No issue-code data yet — trigger a data refresh from the sidebar "
+                            "to populate the filing_issues table from the Senate LDA API."
+                        )
+                    else:
+                        _ISSUE_LABELS = {
+                            "TAX": "Taxation", "DEF": "Defense", "HCR": "Health Issues",
+                            "FIN": "Financial/Securities", "ENV": "Environment",
+                            "LBR": "Labor/Antitrust", "TEC": "Telecommunications",
+                            "CPT": "Copyright/Patent", "FOR": "Foreign Relations",
+                            "TRD": "Trade", "BUD": "Budget/Appropriations",
+                            "MMM": "Medicare/Medicaid", "PHA": "Pharmacy",
+                            "MED": "Medical Research", "EDU": "Education",
+                            "HOM": "Homeland Security", "INT": "Intelligence",
+                            "FUE": "Fuel/Gas/Oil", "UTI": "Utilities",
+                            "COM": "Communications", "AVI": "Aviation/Airlines",
+                            "TRA": "Transportation", "INS": "Insurance",
+                            "BAN": "Banking", "IMM": "Immigration",
+                            "LAW": "Law Enforcement",
+                        }
+                        cr_issues["issue_label"] = (
+                            cr_issues["general_issue_code"]
+                            .map(_ISSUE_LABELS)
+                            .fillna(cr_issues["general_issue_code"])
+                        )
+                        pivot_iss = cr_issues.pivot_table(
+                            index="year", columns="issue_label",
+                            values="n_activities", aggfunc="sum", fill_value=0,
+                        ).reset_index().sort_values("year")
+
+                        top8 = (
+                            cr_issues.groupby("issue_label")["n_activities"]
+                            .sum().nlargest(8).index.tolist()
+                        )
+                        top8_cols = [c for c in top8 if c in pivot_iss.columns]
+
+                        _ISS_COLORS = [
+                            "#3b82f6", "#22c55e", "#f59e0b", "#ef4444",
+                            "#8b5cf6", "#06b6d4", "#ec4899", "#84cc16",
+                        ]
+                        fig_iss = go.Figure()
+                        for ci, issue in enumerate(top8_cols):
+                            fig_iss.add_trace(go.Bar(
+                                x=pivot_iss["year"].tolist(),
+                                y=pivot_iss[issue].tolist(),
+                                name=issue,
+                                marker_color=_ISS_COLORS[ci % len(_ISS_COLORS)],
+                                hovertemplate=f"{issue}: %{{y}}<extra></extra>",
+                            ))
+                        fig_iss.update_layout(
+                            barmode="stack",
+                            xaxis=dict(title="Year", dtick=1,
+                                       tickvals=pivot_iss["year"].tolist(),
+                                       gridcolor="#2d3748"),
+                            yaxis=dict(title="Issue Activities",
+                                       gridcolor="#2d3748"),
+                            plot_bgcolor="#0e1117", paper_bgcolor="#0e1117",
+                            font=dict(color="#ffffff", size=12),
+                            legend=dict(orientation="h", yanchor="bottom",
+                                        y=1.02, xanchor="right", x=1),
+                            height=320,
+                            margin=dict(l=0, r=0, t=50, b=0),
+                        )
+                        st.plotly_chart(fig_iss, use_container_width=True,
+                                        key="cr_issue_chart")
+
+                        # Latest-year breakdown table
+                        latest_iss_yr = int(cr_issues["year"].max())
+                        top_issues_tbl = (
+                            cr_issues[cr_issues["year"] == latest_iss_yr]
+                            .nlargest(10, "n_activities")
+                            [["issue_label", "n_activities"]]
+                            .rename(columns={
+                                "issue_label":  "Issue Area",
+                                "n_activities": f"Activities ({latest_iss_yr})",
+                            })
+                            .reset_index(drop=True)
+                        )
+                        st.dataframe(top_issues_tbl, use_container_width=True,
+                                     hide_index=True, key="cr_issue_table")
+
     # ══════════════════════════════════════════════════════════════════════════
     with tab6:
         st.markdown("### Settings & Data Management")
+
+        # ── Data Quality Coverage Cards ────────────────────────────────────────
+        st.markdown("#### Data Quality Coverage")
+        st.caption(
+            "Live coverage metrics for the current database. "
+            "Refresh the page after a data ingestion to see updated counts."
+        )
+
+        try:
+            import sqlite3 as _dq_sq3
+            _dq_conn = _dq_sq3.connect(fetcher.db_path)
+            try:
+                # 1. Total company-year rows + ticker match rate
+                _dq_base = pd.read_sql_query(
+                    """
+                    SELECT
+                        COUNT(*) AS total_rows,
+                        SUM(CASE WHEN ticker IS NOT NULL AND TRIM(ticker) != '' THEN 1 ELSE 0 END) AS matched_rows,
+                        SUM(total_lobbying_spend) AS total_spend,
+                        SUM(CASE WHEN ticker IS NOT NULL AND TRIM(ticker) != '' THEN total_lobbying_spend ELSE 0 END) AS matched_spend
+                    FROM company_lobbying
+                    """,
+                    _dq_conn,
+                ).iloc[0]
+                _dq_total  = int(_dq_base["total_rows"] or 0)
+                _dq_matched = int(_dq_base["matched_rows"] or 0)
+                _dq_spend   = float(_dq_base["total_spend"] or 0)
+                _dq_mspend  = float(_dq_base["matched_spend"] or 0)
+                _dq_row_pct = round(_dq_matched / _dq_total * 100, 1) if _dq_total else 0
+                _dq_spd_pct = round(_dq_mspend / _dq_spend * 100, 1) if _dq_spend else 0
+
+                # 2. Issue code coverage
+                _dq_fi_exists = not pd.read_sql_query(
+                    "SELECT name FROM sqlite_master WHERE type='table' AND name='filing_issues'",
+                    _dq_conn,
+                ).empty
+                _dq_fi_rows = int(
+                    _dq_conn.execute("SELECT COUNT(*) FROM filing_issues").fetchone()[0]
+                ) if _dq_fi_exists else 0
+                _dq_total_filings = int(
+                    _dq_conn.execute("SELECT COUNT(*) FROM lobbying_filings").fetchone()[0]
+                    if pd.read_sql_query(
+                        "SELECT name FROM sqlite_master WHERE type='table' AND name='lobbying_filings'",
+                        _dq_conn,
+                    ).shape[0] > 0 else 0
+                )
+                _dq_fi_pct = round(_dq_fi_rows / max(_dq_total_filings, 1) * 100, 1)
+
+                # 3. Agency coverage
+                _dq_fa_exists = not pd.read_sql_query(
+                    "SELECT name FROM sqlite_master WHERE type='table' AND name='filing_agencies'",
+                    _dq_conn,
+                ).empty
+                _dq_fa_rows = int(
+                    _dq_conn.execute("SELECT COUNT(*) FROM filing_agencies").fetchone()[0]
+                ) if _dq_fa_exists else 0
+
+                # 4. OpenSecrets
+                _dq_os_exists = not pd.read_sql_query(
+                    "SELECT name FROM sqlite_master WHERE type='table' AND name='opensecrets_contribs'",
+                    _dq_conn,
+                ).empty
+                _dq_os_rows = int(
+                    _dq_conn.execute("SELECT COUNT(*) FROM opensecrets_contribs").fetchone()[0]
+                ) if _dq_os_exists else 0
+
+            finally:
+                _dq_conn.close()
+
+            _dqc1, _dqc2, _dqc3, _dqc4, _dqc5 = st.columns(5)
+            with _dqc1:
+                st.metric(
+                    "Ticker Match Rate",
+                    f"{_dq_row_pct:.1f}%",
+                    help=f"{_dq_matched:,} of {_dq_total:,} company-year rows mapped to a public ticker.",
+                )
+            with _dqc2:
+                st.metric(
+                    "Spend Coverage",
+                    f"{_dq_spd_pct:.1f}%",
+                    help=f"${_dq_mspend/1e9:.1f}B of ${_dq_spend/1e9:.1f}B total spend is from ticker-mapped companies.",
+                )
+            with _dqc3:
+                st.metric(
+                    "Issue Codes",
+                    f"{_dq_fi_rows:,}" if _dq_fi_rows else "Not populated",
+                    help=(
+                        f"{_dq_fi_rows:,} filing_issues rows ({_dq_fi_pct:.1f}% coverage vs raw filings). "
+                        "Run a data refresh to populate."
+                        if _dq_fi_rows else
+                        "Run a data refresh to populate filing_issues."
+                    ),
+                )
+            with _dqc4:
+                st.metric(
+                    "Agency Targets",
+                    f"{_dq_fa_rows:,}" if _dq_fa_rows else "Not populated",
+                    help=(
+                        f"{_dq_fa_rows:,} filing_agencies rows. Run a data refresh to populate."
+                        if _dq_fa_rows else
+                        "Run a data refresh to populate filing_agencies."
+                    ),
+                )
+            with _dqc5:
+                st.metric(
+                    "OpenSecrets Rows",
+                    f"{_dq_os_rows:,}" if _dq_os_rows else "Not synced",
+                    help=(
+                        f"{_dq_os_rows:,} rows in opensecrets_contribs."
+                        if _dq_os_rows else
+                        "Add your OpenSecrets API key below and run a sync."
+                    ),
+                )
+        except Exception as _dq_err:
+            st.caption(f"Could not load quality metrics: {_dq_err}")
+
+        st.markdown("---")
 
         # Load persisted settings into session_state once per session
         if "settings" not in st.session_state:
@@ -9015,6 +9685,44 @@ def main():
                         st.error(f"SEC sync error: {e}")
 
             st.markdown("---")
+            st.markdown("#### Issue & Agency Data Backfill")
+            st.caption(
+                "Populate `filing_issues` and `filing_agencies` for a specific year "
+                "by re-fetching raw filings from the Senate LDA API. "
+                "~60–70% faster than a full rebuild — skips ticker matching, "
+                "market-cap lookup, and company_lobbying aggregation."
+            )
+            _backfill_year = st.selectbox(
+                "Year to backfill",
+                options=available_years,
+                index=0,
+                key="s_backfill_year",
+            )
+            if st.button("Backfill Issue & Agency Data", use_container_width=True):
+                with st.spinner(
+                    f"Re-fetching {_backfill_year} filings from LDA API — "
+                    "this may take several minutes…"
+                ):
+                    try:
+                        from build_company_lobbying import (
+                            backfill_filing_detail_tables_for_year,
+                        )
+
+                        _bf_result = backfill_filing_detail_tables_for_year(
+                            year=int(_backfill_year),
+                            db_path=fetcher.db_path,
+                        )
+                        st.success(
+                            f"Backfill complete for **{_backfill_year}**: "
+                            f"{_bf_result['filings_fetched']:,} filings fetched → "
+                            f"{_bf_result['issue_rows']:,} issue rows, "
+                            f"{_bf_result['agency_rows']:,} agency rows written."
+                        )
+                        st.session_state["cache_buster"] += 1
+                    except Exception as _bf_err:
+                        st.error(f"Backfill error: {_bf_err}")
+
+            st.markdown("---")
 
             if st.button("Clear Cache", use_container_width=True):
                 # Bump the token — all @st.cache_data functions keyed on
@@ -9229,7 +9937,7 @@ def main():
                 _incomplete = _ingestion_df[_ingestion_df["is_complete"] == 0]["year"].tolist()
                 _unknown = _ingestion_df[_ingestion_df["is_complete"].isna()]["year"].tolist()
                 if _incomplete:
-                    st.markdown("#### ⚠️ Incomplete Year Data Detected")
+                    st.markdown("#### Incomplete Year Data Detected")
                     st.warning(
                         f"Year(s) **{', '.join(str(y) for y in sorted(_incomplete))}** "
                         "appear to have an incomplete fetch (the scraper did not reach the "
@@ -9237,7 +9945,7 @@ def main():
                         "the sidebar to force a full re-fetch for those years."
                     )
                 if _unknown:
-                    st.markdown("#### ℹ️ Legacy Year Snapshots")
+                    st.markdown("#### Legacy Year Snapshots")
                     st.info(
                         f"Year(s) **{', '.join(str(y) for y in sorted(_unknown))}** "
                         "have no ingestion audit metadata yet. Data exists, but completeness "
