@@ -2,8 +2,8 @@
 
 # US Lobbying Equities Strategy Launcher
 echo "=================================================="
-echo "US Lobbying Equities Long Only Strategy"
-echo "Institutional-Grade Lobbying Analytics Tool"
+echo "US Lobbying Disclosure Tracker"
+echo "Federal lobbying filings by company, issue, and quarter"
 echo "=================================================="
 echo ""
 

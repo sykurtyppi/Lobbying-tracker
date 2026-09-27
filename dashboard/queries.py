@@ -3,7 +3,6 @@ Cached SQLite read helpers: years, sectors, ingestion status, alias queue, DB st
 """
 
 import os
-import sqlite3
 from datetime import datetime
 
 import pandas as pd

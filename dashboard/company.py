@@ -2,22 +2,8 @@
 Company research queries: search, annual spend, stock snapshots, lobbyist firms, sector peers.
 """
 
-import sqlite3
-
 import pandas as pd
 import streamlit as st
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-#  COMPANY RESEARCH — DATA FUNCTIONS
-# ─────────────────────────────────────────────────────────────────────────────
-
-_PERIOD_TO_QUARTER = {
-    "first_quarter": "Q1",
-    "second_quarter": "Q2",
-    "third_quarter": "Q3",
-    "fourth_quarter": "Q4",
-}
 
 
 @st.cache_data

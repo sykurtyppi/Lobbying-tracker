@@ -17,10 +17,3 @@ def format_currency(value):
         return f"${value/1e3:.2f}K"
     else:
         return f"${value:.0f}"
-
-
-def format_percentage(value):
-    """Format number as percentage"""
-    if pd.isna(value):
-        return "N/A"
-    return f"{value:.2f}%"

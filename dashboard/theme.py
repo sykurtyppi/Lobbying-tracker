@@ -107,7 +107,7 @@ _APP_CSS = """
 def _configure_streamlit_page() -> None:
     """Apply page config and dashboard CSS only during UI runtime."""
     st.set_page_config(
-        page_title="US Lobbying Equities Strategy",
+        page_title="US Lobbying Disclosure Tracker",
         page_icon="",
         layout="wide",
         initial_sidebar_state="expanded",

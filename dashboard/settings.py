@@ -4,7 +4,6 @@ Persisted dashboard settings (data/app_settings.json) and custom ticker mapping 
 
 import os
 import json
-import sqlite3
 from datetime import datetime, timezone
 
 import streamlit as st

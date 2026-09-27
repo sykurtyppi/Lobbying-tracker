@@ -10,13 +10,12 @@ import streamlit as st
 
 from dashboard.formatting import format_currency
 from dashboard.leaderboard import get_filtered_data, get_yearly_summary
-from dashboard.sections.benchmark_section import _render_benchmark_section
 from dashboard.sector_signals import get_sector_spend_by_year
 
 
 def render(fetcher, selected_year, selected_quarter, market_cap_filter, sector_filter, min_spend):
     """Render the Overview tab."""
-    st.markdown("### Strategy Metrics")
+    st.markdown("### Coverage Metrics")
 
     # Get filtered data first so metrics are grounded in live DB values.
     holdings_df = get_filtered_data(
@@ -321,11 +320,11 @@ def render(fetcher, selected_year, selected_quarter, market_cap_filter, sector_f
             st.plotly_chart(fig_sec_trend, use_container_width=True,
                             key="overview_sector_trend")
         
-    # Current holdings summary
-    st.markdown("### Current Strategy Holdings")
+    # Companies matching the current filters
+    st.markdown("### Companies Matching Filters")
 
     if len(holdings_df) == 0:
-        st.warning("No holdings match your current filters. Adjust filters in the sidebar.")
+        st.warning("No companies match your current filters. Adjust filters in the sidebar.")
     else:
         # Top Lobbying Yield highlight
         valid_ratios = holdings_df[holdings_df['spend_to_mcap_ratio'].notna() & (holdings_df['market_cap'].notna())]
@@ -352,7 +351,7 @@ def render(fetcher, selected_year, selected_quarter, market_cap_filter, sector_f
                 
             st.markdown("---")
             
-        # Show top holdings
+        # Show top companies
         display_df = holdings_df.head(20).copy()
         display_df["ticker"] = display_df["ticker"].fillna("N/A")
         display_df['Lobbying Spend'] = display_df['total_lobbying_spend'].apply(format_currency)
@@ -380,15 +379,6 @@ def render(fetcher, selected_year, selected_quarter, market_cap_filter, sector_f
         st.download_button(
             label="Download Holdings CSV",
             data=raw_export.to_csv(index=False).encode("utf-8"),
-            file_name=f"holdings_{selected_year}_{selected_quarter}.csv",
+            file_name=f"companies_{selected_year}_{selected_quarter}.csv",
             mime="text/csv",
         )
-
-    # ── Strategy vs S&P 500 Benchmark (promoted from Performance tab) ──────
-    st.markdown("---")
-    st.markdown("#### Strategy vs. S&P 500 — Annual Returns")
-    _render_benchmark_section(
-        fetcher.db_path,
-        cache_buster=st.session_state["cache_buster"],
-        key_prefix="tab1_bench",
-    )

@@ -2,7 +2,6 @@
 Sidebar controls: year/quarter/market-cap/sector filters, data refresh, and DB status.
 """
 
-import sys
 import os
 import time
 import sqlite3

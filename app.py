@@ -1,6 +1,6 @@
 """
-US Lobbying Equities Strategy - Professional Dashboard
-Institutional-grade tool for tracking corporate lobbying expenditures
+US Lobbying Disclosure Tracker - Dashboard
+Explore federal lobbying filings by company, issue, and quarter
 
 Entry point only. Analytics live in ``dashboard/`` (one module per concern)
 and each tab renders from ``dashboard/tabs/``. The public helpers are
@@ -15,45 +15,15 @@ from dashboard.sidebar import render_sidebar
 from dashboard.tabs import (
     company_research,
     overview,
-    performance,
     settings_tab,
-    signals,
     top_lobbyists,
 )
 
 # Re-exports: keep the historical ``app.<helper>`` surface stable.
-from dashboard.acceleration import (  # noqa: F401
-    _build_acceleration_year_frame,
-    _get_complete_signal_years,
-    _rank_acceleration_factor,
-    _safe_pct_change,
-    _select_production_portfolio,
-    _to_period_idx,
-    get_acceleration_event_backtest,
-    get_acceleration_features,
-    get_acceleration_oos_split_backtest,
-    get_acceleration_rolling_windows,
-    get_acceleration_simplicity_check,
-    get_production_go_nogo_metrics,
-    get_production_strategy_backtest,
-    get_production_strategy_holdings,
-    get_sector_neutral_acceleration_backtest,
-)
-from dashboard.benchmark import (  # noqa: F401
-    _cost_pct_from_turnover,
-    _equal_weight_turnover_pct,
-    _fetch_spx_annual_returns,
-    _fetch_spx_returns_for_signal_years,
-    _q4_signal_window,
-    _sanitize_ticker_list,
-    get_benchmark_comparison,
-    get_signal_returns,
-)
 from dashboard.charts import (  # noqa: F401
     create_lobbying_treemap,
 )
 from dashboard.company import (  # noqa: F401
-    _PERIOD_TO_QUARTER,
     get_company_annual_spend,
     get_company_entity_names,
     get_company_lobbyist_firms,
@@ -62,12 +32,10 @@ from dashboard.company import (  # noqa: F401
     search_companies,
 )
 from dashboard.conviction import (  # noqa: F401
-    get_conviction_benchmark,
     get_conviction_scores,
 )
 from dashboard.formatting import (  # noqa: F401
     format_currency,
-    format_percentage,
 )
 from dashboard.leaderboard import (  # noqa: F401
     aggregate_entities,
@@ -76,12 +44,8 @@ from dashboard.leaderboard import (  # noqa: F401
     get_yearly_summary,
     get_yoy_growth_leaders,
 )
-from dashboard.quality import (  # noqa: F401
-    _ensure_quality_table,
-    fetch_quality_metrics_for_tickers,
-    get_quality_metrics_from_db,
-)
 from dashboard.queries import (  # noqa: F401
+    _REPO_ROOT,
     _get_fuzzy_audit,
     _get_revalidation_preview,
     _load_opensecrets_contribs,
@@ -98,20 +62,12 @@ from dashboard.queries import (  # noqa: F401
     get_sec_universe_stats,
     get_top_issue_codes_by_year,
 )
-from dashboard.regime import (  # noqa: F401
-    get_policy_risk_regime_features,
-    get_regime_conditioned_acceleration_performance,
-)
-from dashboard.sections.benchmark_section import (  # noqa: F401
-    _render_benchmark_section,
-)
 from dashboard.sector_signals import (  # noqa: F401
     _SECTOR_ETF_MAP,
-    get_new_entrant_signal,
-    get_sector_rotation_signal,
     get_sector_spend_by_year,
 )
 from dashboard.settings import (  # noqa: F401
+    _REPO_ROOT,
     _SETTINGS_CONFIG_MAP,
     _SETTINGS_PATH,
     _config_defaults,
@@ -119,11 +75,6 @@ from dashboard.settings import (  # noqa: F401
     apply_settings_to_config,
     load_settings,
     save_settings,
-)
-from dashboard.stats import (  # noqa: F401
-    _compute_overfit_diagnostics,
-    _compute_return_risk_stats,
-    _exact_binomial_pvalue,
 )
 from dashboard.theme import (  # noqa: F401
     _APP_CSS,
@@ -138,8 +89,8 @@ def main():
         st.session_state["cache_buster"] = 0
 
     # Header
-    st.markdown("<h1 style='text-align: center;'>US Lobbying Equities Long Only Strategy</h1>", unsafe_allow_html=True)
-    st.markdown("<p style='text-align: center; color: #a0a0a0;'>Institutional-Grade Lobbying Disclosure Analytics</p>", unsafe_allow_html=True)
+    st.markdown("<h1 style='text-align: center;'>US Lobbying Disclosure Tracker</h1>", unsafe_allow_html=True)
+    st.markdown("<p style='text-align: center; color: #a0a0a0;'>Who is lobbying, on what, and how it changes quarter to quarter</p>", unsafe_allow_html=True)
     
     # Initialize tools
     fetcher = get_data_fetcher()
@@ -188,9 +139,8 @@ def main():
             "Signals may be biased by partial data until this year is fully refreshed."
         )
 
-    tab1, tab2, tab3, tab4, tab5, tab6 = st.tabs([
-        " Overview", " Top Lobbyists", "Performance",
-        "Signals", "Company Research", " Settings"
+    tab1, tab2, tab3, tab4 = st.tabs([
+        "Overview", "Top Lobbyists", "Company Research", "Settings"
     ])
 
     with tab1:
@@ -200,15 +150,9 @@ def main():
         top_lobbyists.render(fetcher, selected_year, selected_quarter, market_cap_filter, sector_filter, min_spend)
 
     with tab3:
-        performance.render(fetcher, selected_year, min_spend)
-
-    with tab4:
-        signals.render(fetcher, selected_year, min_spend)
-
-    with tab5:
         company_research.render(fetcher)
 
-    with tab6:
+    with tab4:
         settings_tab.render(fetcher, selected_year, available_years)
 
     
@@ -217,7 +161,7 @@ def main():
     st.markdown(
         "<p style='text-align: center; color: #a0a0a0; font-size: 12px;'>"
         "Data sources: Senate Lobbying Disclosure, OpenSecrets.org, Yahoo Finance | "
-        "Strategy based on public lobbying expenditure filings | "
+        "Built on public lobbying expenditure filings | "
         "For informational purposes only"
         "</p>",
         unsafe_allow_html=True

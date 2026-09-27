@@ -1,21 +1,25 @@
 # Lobbying Tracker
 
-Institutional-style research and dashboard toolkit for U.S. federal lobbying disclosures and equity signal analysis.
+Dashboard and data pipeline for U.S. federal lobbying disclosures: who is lobbying, on what issues, and how spend changes quarter to quarter.
 
 [![CI](https://github.com/sykurtyppi/Lobbying-tracker/actions/workflows/ci.yml/badge.svg)](https://github.com/sykurtyppi/Lobbying-tracker/actions/workflows/ci.yml)
 
 ## What It Does
 
 - Ingests Senate LDA filings and builds normalized company-quarter spend data
+- Captures issue codes and government agencies targeted per filing
 - Maps lobbying entities to public tickers with alias + SEC-universe support
-- Enriches with market cap and forward return snapshots
-- Runs signal research/backtests (acceleration, hist z-spike, sector-neutral, OOS split)
-- Serves a Streamlit dashboard for exploration, validation, and production picks
+- Enriches with market cap and price snapshots
+- Serves a Streamlit dashboard: overview, top lobbyists, company research, settings
+
+Signal research and backtests (acceleration, hist z-spike, sector-neutral, OOS split) were
+removed from the dashboard; the batch runner in `src/backtest_signal_research.py` and
+`src/analytics_core.py` remain for offline research.
 
 ## Project Structure
 
 - `app.py` — Streamlit entry point (thin; re-exports the analytics helpers)
-- `dashboard/` — dashboard package: one module per concern (`queries`, `leaderboard`, `conviction`, `benchmark`, `acceleration`, `regime`, `sector_signals`, `company`, `stats`, `quality`, `settings`, `theme`) plus `sidebar.py` and `tabs/` (one module per tab)
+- `dashboard/` — dashboard package: one module per concern (`queries`, `leaderboard`, `conviction`, `sector_signals`, `company`, `settings`, `theme`, `charts`, `formatting`) plus `sidebar.py` and `tabs/` (one module per tab)
 - `src/build_company_lobbying.py` — ingestion + enrichment pipeline
 - `src/senate_scraper.py` — Senate API fetcher
 - `src/data_fetcher.py` — mapping + utility fetch logic

@@ -2,7 +2,6 @@
 Entity aggregation, filtered leaderboard, YoY growth, enriched leaderboard.
 """
 
-import sqlite3
 from datetime import datetime
 
 import pandas as pd
