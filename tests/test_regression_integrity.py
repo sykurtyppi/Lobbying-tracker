@@ -259,7 +259,7 @@ class RegressionIntegrityTests(unittest.TestCase):
         if not DB_PATH.exists():
             self.skipTest("Fixture database was not created.")
 
-    @patch("app._fetch_spx_returns_for_signal_years")
+    @patch("dashboard.benchmark._fetch_spx_returns_for_signal_years")
     def test_benchmark_year_alignment_and_cost_adjustment(self, mock_spx):
         # Deterministic SPX map; values are not material for this test.
         mock_spx.return_value = ({yr: 0.0 for yr in range(2018, 2030)}, None)
@@ -290,7 +290,7 @@ class RegressionIntegrityTests(unittest.TestCase):
         deltas = (df["strategy_return_gross"] - df["strategy_return"]).round(2)
         self.assertTrue((deltas == df["cost_applied_pct"].round(2)).all())
 
-    @patch("app._fetch_spx_returns_for_signal_years")
+    @patch("dashboard.benchmark._fetch_spx_returns_for_signal_years")
     def test_new_entrant_hold_year_alignment(self, mock_spx):
         mock_spx.return_value = ({yr: 0.0 for yr in range(2018, 2030)}, None)
 
@@ -457,7 +457,7 @@ class RegressionIntegrityTests(unittest.TestCase):
             tickers = tickers[tickers != ""]
             self.assertEqual(int(tickers.nunique()), int(len(tickers)))
 
-    @patch("app._fetch_spx_returns_for_signal_years")
+    @patch("dashboard.benchmark._fetch_spx_returns_for_signal_years")
     def test_acceleration_backtest_year_alignment(self, mock_spx):
         mock_spx.return_value = ({yr: 0.0 for yr in range(2018, 2035)}, None)
 
@@ -483,7 +483,7 @@ class RegressionIntegrityTests(unittest.TestCase):
                 calc = (bt_df.loc[valid, top_col] - bt_df.loc[valid, uni_col]).round(2)
                 self.assertTrue((calc == bt_df.loc[valid, alpha_col].round(2)).all())
 
-    @patch("app._fetch_spx_returns_for_signal_years")
+    @patch("dashboard.benchmark._fetch_spx_returns_for_signal_years")
     def test_acceleration_rolling_windows_have_expected_shape(self, mock_spx):
         mock_spx.return_value = ({yr: 0.0 for yr in range(2018, 2035)}, None)
 

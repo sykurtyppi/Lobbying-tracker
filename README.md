@@ -14,7 +14,8 @@ Institutional-style research and dashboard toolkit for U.S. federal lobbying dis
 
 ## Project Structure
 
-- `app.py` — Streamlit dashboard
+- `app.py` — Streamlit entry point (thin; re-exports the analytics helpers)
+- `dashboard/` — dashboard package: one module per concern (`queries`, `leaderboard`, `conviction`, `benchmark`, `acceleration`, `regime`, `sector_signals`, `company`, `stats`, `quality`, `settings`, `theme`) plus `sidebar.py` and `tabs/` (one module per tab)
 - `src/build_company_lobbying.py` — ingestion + enrichment pipeline
 - `src/senate_scraper.py` — Senate API fetcher
 - `src/data_fetcher.py` — mapping + utility fetch logic
