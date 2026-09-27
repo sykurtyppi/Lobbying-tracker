@@ -56,6 +56,13 @@ class SenateLobbyingScraper:
         self.session.headers.update({
             'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
         })
+        # Optional API key raises the LDA rate limit from 15 to 120 req/min.
+        api_key = getattr(_cfg, "SENATE_API_KEY", "") if _cfg is not None else ""
+        if api_key:
+            self.session.headers["Authorization"] = f"Token {api_key}"
+        self.page_delay_seconds = float(
+            getattr(_cfg, "SENATE_PAGE_DELAY_SECONDS", 2.0) if _cfg is not None else 2.0
+        )
         self.last_fetch_meta = {}
 
     def _switch_api_base(self) -> bool:
@@ -185,8 +192,8 @@ class SenateLobbyingScraper:
                     # Increment page - CRITICAL: keep filing_year in params!
                     params['page'] += 1
                     
-                    # Be nice to the API - longer delay between pages
-                    time.sleep(2)
+                    # Be nice to the API - delay between pages (shorter when keyed)
+                    time.sleep(self.page_delay_seconds)
                     
                 except requests.exceptions.RequestException as e:
                     # Connection/DNS failures can happen during endpoint migration

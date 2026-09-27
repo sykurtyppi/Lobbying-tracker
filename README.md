@@ -26,12 +26,21 @@ Institutional-style research and dashboard toolkit for U.S. federal lobbying dis
 ## Quickstart
 
 ```bash
-cd "/Users/tristanalejandro/Lobbying tracker"
 python3 -m venv venv
 source venv/bin/activate
 pip install -r requirements.txt
 python3 src/build_company_lobbying.py
 venv/bin/streamlit run app.py
+```
+
+## Optional Environment Variables
+
+- `LDA_API_KEY` — LDA.gov API key (register at https://lda.gov/api/register/). Raises the fetch rate limit from 15 to 120 requests/minute, cutting a full-year ingest from ~2.5 hours to ~20 minutes.
+- `SEC_CONTACT_EMAIL` — contact address sent in the User-Agent for the SEC ticker-universe file. SEC rejects requests without a real address, so the universe sync is skipped until this is set.
+
+```bash
+export LDA_API_KEY="..."
+export SEC_CONTACT_EMAIL="you@example.com"
 ```
 
 ## Run Tests

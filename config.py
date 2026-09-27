@@ -3,6 +3,8 @@ Configuration file for US Lobbying Equities Strategy Tool
 Customize settings here to match your preferences
 """
 
+import os
+
 # =============================================================================
 # DATA SOURCE CONFIGURATION
 # =============================================================================
@@ -10,6 +12,12 @@ Customize settings here to match your preferences
 # Senate Lobbying Disclosure Database
 # Prefer lda.gov (lda.senate.gov is scheduled to sunset on 2026-06-30).
 SENATE_API_BASE = "https://lda.gov/api/v1"
+# Optional LDA API key (register at https://lda.gov/api/register/). Raises the
+# rate limit from 15 to 120 requests/minute. Read from the environment so the
+# key never lands in source control.
+SENATE_API_KEY = os.environ.get("LDA_API_KEY", "").strip()
+# Seconds to pause between pages; shorter when a key is present.
+SENATE_PAGE_DELAY_SECONDS = 0.5 if SENATE_API_KEY else 2.0
 SENATE_AUTO_UPDATE = True
 SENATE_UPDATE_INTERVAL_HOURS = 24
 # Safety cap for API pagination (25 records/page)
@@ -32,7 +40,11 @@ LDA_FILING_LAG_DAYS = 20
 SEC_UNIVERSE_AUTO_SYNC = True
 SEC_UNIVERSE_REFRESH_DAYS = 14
 SEC_TICKER_UNIVERSE_URL = "https://www.sec.gov/files/company_tickers_exchange.json"
-SEC_USER_AGENT = "LobbyingTracker/1.0 (research@localhost)"
+# SEC fair-access policy requires a real contact address in the User-Agent;
+# a placeholder like research@localhost is rejected with HTTP 403.
+# Set SEC_CONTACT_EMAIL in the environment to enable the ticker-universe sync.
+SEC_CONTACT_EMAIL = os.environ.get("SEC_CONTACT_EMAIL", "").strip()
+SEC_USER_AGENT = f"LobbyingTracker/1.0 ({SEC_CONTACT_EMAIL or 'research@localhost'})"
 # Restrict SEC universe to liquid US exchanges for safer mapping.
 SEC_ALLOWED_EXCHANGES = ["Nasdaq", "NYSE", "NYSE American"]
 
