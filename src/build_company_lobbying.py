@@ -656,7 +656,54 @@ def clean_nonpositive_company_spend(db_path: str = None, dry_run: bool = True) -
 
 # ── Schema versioning ─────────────────────────────────────────────────────────
 # Increment this when a structural change is made that existing DBs need to adopt.
-CURRENT_SCHEMA_VERSION = 3
+CURRENT_SCHEMA_VERSION = 4
+
+
+def repair_filing_detail_client_names(db_path: str = None, cursor=None) -> dict:
+    """
+    Fill empty client_name values in filing_issues / filing_agencies from
+    lobbying_filings, joined on filing_uuid.
+
+    Rows written by the backfill before the double-parse fix carried an empty
+    client_name, which made the dashboard's issue-code views (keyed on
+    client_name) report no data. Rows whose filing is not in lobbying_filings
+    (sub-threshold amounts, superseded amendments) are left as-is; they never
+    map to a company anyway.
+
+    Returns
+    -------
+    dict with keys: issues_repaired, agencies_repaired
+    """
+    own_conn = cursor is None
+    if own_conn:
+        if db_path is None:
+            db_path = config.DATABASE_PATH
+        conn = sqlite3.connect(db_path)
+        cursor = conn.cursor()
+    try:
+        counts = {}
+        for table, key in (("filing_issues", "issues_repaired"), ("filing_agencies", "agencies_repaired")):
+            cursor.execute(
+                f"""
+                UPDATE {table}
+                SET client_name = (
+                    SELECT lf.client_name FROM lobbying_filings lf
+                    WHERE lf.filing_uuid = {table}.filing_uuid
+                )
+                WHERE COALESCE(client_name, '') = ''
+                  AND filing_uuid IN (
+                    SELECT filing_uuid FROM lobbying_filings
+                    WHERE COALESCE(client_name, '') != ''
+                  )
+                """
+            )
+            counts[key] = cursor.rowcount
+        if own_conn:
+            conn.commit()
+        return counts
+    finally:
+        if own_conn:
+            conn.close()
 
 
 def ensure_schema_current(db_path: str) -> dict:
@@ -668,6 +715,7 @@ def ensure_schema_current(db_path: str) -> dict:
     v1  Initial schema (company_lobbying, lobbying_filings, stock_performance, …)
     v2  Add filing_issues + filing_agencies tables (issue-code / agency-target data)
     v3  Add schema_version tracking table itself
+    v4  Repair empty client_name in filing_issues/filing_agencies from lobbying_filings
 
     Returns
     -------
@@ -710,6 +758,26 @@ def ensure_schema_current(db_path: str) -> dict:
                 (3, now_iso, "schema_version tracking table bootstrapped"),
             )
             migrations_applied.append(3)
+
+        if db_version < 4:
+            # Only meaningful when the detail tables exist alongside lobbying_filings.
+            existing = {
+                r[0] for r in cursor.execute("SELECT name FROM sqlite_master WHERE type='table'")
+            }
+            if {"filing_issues", "filing_agencies", "lobbying_filings"} <= existing:
+                repaired = repair_filing_detail_client_names(cursor=cursor)
+                desc = (
+                    "repaired empty client_name from lobbying_filings: "
+                    f"{repaired['issues_repaired']} issue rows, "
+                    f"{repaired['agencies_repaired']} agency rows"
+                )
+            else:
+                desc = "client_name repair skipped (detail tables not present)"
+            cursor.execute(
+                "INSERT INTO schema_version (version, applied_at, description) VALUES (?, ?, ?)",
+                (4, now_iso, desc),
+            )
+            migrations_applied.append(4)
 
         conn.commit()
         return {
@@ -767,8 +835,10 @@ def backfill_filing_detail_tables_for_year(
     if max_pages is not None:
         fetch_kwargs["max_pages"] = max_pages
 
-    raw_filings = scraper.get_filings(filing_year=year, **fetch_kwargs)
-    parsed = scraper._parse_filings(raw_filings)
+    # get_filings() already returns parsed dicts (see SenateLobbyingScraper.get_filings).
+    # Parsing them a second time looks for the raw ``client``/``registrant`` objects,
+    # which parsed dicts no longer carry, and silently blanks every client_name.
+    parsed = scraper.get_filings(filing_year=year, **fetch_kwargs)
 
     if not parsed:
         _log(f"[backfill_detail] Year {year}: no filings returned — skipping.")

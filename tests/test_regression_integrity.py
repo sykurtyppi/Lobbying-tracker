@@ -568,6 +568,131 @@ class BugRegressionTests(unittest.TestCase):
         )
 
 
+    def test_backfill_uses_parsed_filings_without_reparsing(self):
+        """
+        Regression: SenateLobbyingScraper.get_filings() already returns parsed
+        dicts. The backfill parsed them a second time, which looked for the raw
+        ``client`` object and blanked every client_name it wrote.
+        """
+        from src.build_company_lobbying import (
+            _ensure_filing_detail_tables,
+            backfill_filing_detail_tables_for_year,
+        )
+
+        parsed_filing = {
+            "filing_uuid": "uuid-1",
+            "filing_type": "Q1",
+            "filing_year": 2026,
+            "filing_period": "first_quarter",
+            "filing_date": "2026-04-20T00:00:00-04:00",
+            "registrant_name": "Lobby LLC",
+            "registrant_id": 1,
+            "client_name": "Acme Corp",
+            "client_id": 2,
+            "amount": 50000.0,
+            "lobbying_activities": [
+                {
+                    "general_issue_code": "TAX",
+                    "description": "Corporate tax reform",
+                    "government_entities": [{"id": 1, "name": "SENATE"}],
+                }
+            ],
+        }
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp_db = str(Path(tmpdir) / "backfill.db")
+            conn = sqlite3.connect(tmp_db)
+            _ensure_filing_detail_tables(conn.cursor())
+            conn.commit()
+            conn.close()
+
+            with patch(
+                "src.build_company_lobbying.SenateLobbyingScraper.get_filings",
+                return_value=[parsed_filing],
+            ):
+                result = backfill_filing_detail_tables_for_year(2026, db_path=tmp_db)
+
+            self.assertEqual(result["issue_rows"], 1)
+            self.assertEqual(result["agency_rows"], 1)
+            conn = sqlite3.connect(tmp_db)
+            try:
+                self.assertEqual(
+                    conn.execute("SELECT client_name, specific_issues_text FROM filing_issues").fetchall(),
+                    [("Acme Corp", "Corporate tax reform")],
+                )
+                self.assertEqual(
+                    conn.execute("SELECT client_name, agency_name FROM filing_agencies").fetchall(),
+                    [("Acme Corp", "SENATE")],
+                )
+            finally:
+                conn.close()
+
+    def test_repair_fills_empty_client_names_from_lobbying_filings(self):
+        """
+        Detail rows written with an empty client_name are repaired by joining
+        lobbying_filings on filing_uuid; rows with no matching filing are left alone.
+        """
+        from src.build_company_lobbying import (
+            _ensure_filing_detail_tables,
+            ensure_schema_current,
+            repair_filing_detail_client_names,
+        )
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp_db = str(Path(tmpdir) / "repair.db")
+            conn = sqlite3.connect(tmp_db)
+            try:
+                cur = conn.cursor()
+                _ensure_filing_detail_tables(cur)
+                cur.execute("CREATE TABLE lobbying_filings (filing_uuid TEXT, client_name TEXT)")
+                cur.executemany(
+                    "INSERT INTO lobbying_filings VALUES (?, ?)",
+                    [("u1", "Acme Corp"), ("u2", "Beta Inc")],
+                )
+                cur.executemany(
+                    "INSERT INTO filing_issues (filing_uuid, general_issue_code, year, quarter, client_name) "
+                    "VALUES (?, ?, 2025, 'Q1', ?)",
+                    [("u1", "TAX", ""), ("u2", "HOU", None), ("u3", "EDU", ""), ("u1", "IMM", "Kept As Is")],
+                )
+                cur.executemany(
+                    "INSERT INTO filing_agencies (filing_uuid, agency_name, year, quarter, client_name) "
+                    "VALUES (?, ?, 2025, 'Q1', ?)",
+                    [("u1", "SENATE", ""), ("u3", "SENATE", "")],
+                )
+                conn.commit()
+            finally:
+                conn.close()
+
+            counts = repair_filing_detail_client_names(db_path=tmp_db)
+            self.assertEqual(counts, {"issues_repaired": 2, "agencies_repaired": 1})
+
+            conn = sqlite3.connect(tmp_db)
+            try:
+                self.assertEqual(
+                    conn.execute(
+                        "SELECT filing_uuid, general_issue_code, client_name FROM filing_issues ORDER BY id"
+                    ).fetchall(),
+                    [("u1", "TAX", "Acme Corp"), ("u2", "HOU", "Beta Inc"), ("u3", "EDU", ""), ("u1", "IMM", "Kept As Is")],
+                )
+                self.assertEqual(
+                    conn.execute("SELECT filing_uuid, client_name FROM filing_agencies ORDER BY id").fetchall(),
+                    [("u1", "Acme Corp"), ("u3", "")],
+                )
+            finally:
+                conn.close()
+
+            # Running the schema migration is idempotent: v4 is recorded once and
+            # a second call repairs nothing further.
+            first = ensure_schema_current(tmp_db)
+            self.assertIn(4, first["migrations_applied"])
+            second = ensure_schema_current(tmp_db)
+            self.assertEqual(second["migrations_applied"], [])
+            self.assertEqual(
+                repair_filing_detail_client_names(db_path=tmp_db),
+                {"issues_repaired": 0, "agencies_repaired": 0},
+            )
+
+
     def test_filing_issues_table_created_and_populated_by_build(self):
         """
         Verify that _ensure_filing_detail_tables creates both tables, and that
