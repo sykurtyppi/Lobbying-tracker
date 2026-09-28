@@ -262,8 +262,9 @@ class SenateLobbyingScraper:
                     'client_name': filing.get('client', {}).get('name'),
                     'client_id': filing.get('client', {}).get('client_id'),
                     'amount': self._parse_amount(filing.get('income') or filing.get('expenses')),
+                    # government_entities live inside each activity; see
+                    # build_company_lobbying.extract_filing_details.
                     'lobbying_activities': filing.get('lobbying_activities', []),
-                    'government_entities': filing.get('government_entities', [])
                 }
                 
                 parsed_filings.append(parsed)
