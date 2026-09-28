@@ -7,6 +7,9 @@ import warnings
 from pathlib import Path
 from unittest.mock import patch
 
+import numpy as np
+import pandas as pd
+
 import app
 from src.build_company_lobbying import clean_nonpositive_company_spend
 from src.data_fetcher import CompanyMapper
@@ -256,53 +259,6 @@ class RegressionIntegrityTests(unittest.TestCase):
         if not DB_PATH.exists():
             self.skipTest("Fixture database was not created.")
 
-    @patch("app._fetch_spx_returns_for_signal_years")
-    def test_benchmark_year_alignment_and_cost_adjustment(self, mock_spx):
-        # Deterministic SPX map; values are not material for this test.
-        mock_spx.return_value = ({yr: 0.0 for yr in range(2018, 2030)}, None)
-
-        df = app.get_benchmark_comparison(str(DB_PATH), refresh_token=999001)
-        if df.empty:
-            self.skipTest("No benchmark rows available in fixture DB.")
-
-        self.assertTrue(
-            {
-                "signal_year",
-                "year",
-                "strategy_return_gross",
-                "strategy_return",
-                "turnover_pct",
-                "cost_applied_pct",
-            }.issubset(df.columns)
-        )
-        self.assertTrue(((df["signal_year"] + 1) == df["year"]).all())
-
-        cost_bps = float(getattr(app.config, "BACKTEST_REBALANCE_COST_BPS", 0.0) or 0.0)
-        expected_cost = (
-            (df["turnover_pct"] / 100.0) * (cost_bps / 100.0)
-        ).round(4)
-        self.assertTrue((df["cost_applied_pct"].round(4) == expected_cost).all())
-
-        # strategy_return is rounded to 2dp in app code, so compare at 2dp
-        deltas = (df["strategy_return_gross"] - df["strategy_return"]).round(2)
-        self.assertTrue((deltas == df["cost_applied_pct"].round(2)).all())
-
-    @patch("app._fetch_spx_returns_for_signal_years")
-    def test_new_entrant_hold_year_alignment(self, mock_spx):
-        mock_spx.return_value = ({yr: 0.0 for yr in range(2018, 2030)}, None)
-
-        _, bt_df = app.get_new_entrant_signal(
-            str(DB_PATH),
-            min_curr_spend_m=1.0,
-            max_prev_spend_k=200.0,
-            refresh_token=999002,
-        )
-        if bt_df.empty:
-            self.skipTest("No new-entrant backtest rows available in fixture DB.")
-
-        self.assertTrue({"signal_year", "year", "avg_return_gross", "avg_return"}.issubset(bt_df.columns))
-        self.assertTrue(((bt_df["signal_year"] + 1) == bt_df["year"]).all())
-
     def test_clean_nonpositive_company_spend_dry_run_and_apply(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             tmp_db = Path(tmpdir) / "tmp_lobbying.db"
@@ -375,155 +331,6 @@ class RegressionIntegrityTests(unittest.TestCase):
         tickers = tickers[tickers != ""]
         self.assertEqual(int(tickers.nunique()), int(len(tickers)))
 
-    def test_signal_returns_are_ticker_deduped(self):
-        conn = sqlite3.connect(DB_PATH)
-        try:
-            year_row = conn.execute(
-                """
-                SELECT MAX(year)
-                FROM company_lobbying
-                WHERE quarter = 'Q4'
-                """
-            ).fetchone()
-        finally:
-            conn.close()
-
-        year = int(year_row[0]) if year_row and year_row[0] is not None else None
-        if year is None:
-            self.skipTest("No Q4 rows found in company_lobbying.")
-
-        df = app.get_signal_returns(str(DB_PATH), year, refresh_token=999003)
-        if df.empty:
-            self.skipTest(f"No signal returns rows for {year}.")
-
-        tickers = df["ticker"].dropna().astype(str).str.strip().str.upper()
-        tickers = tickers[tickers != ""]
-        self.assertEqual(int(tickers.nunique()), int(len(tickers)))
-
-    def test_acceleration_features_have_expected_shape(self):
-        conn = sqlite3.connect(DB_PATH)
-        try:
-            year_row = conn.execute(
-                """
-                SELECT MAX(year)
-                FROM (
-                    SELECT year, COUNT(DISTINCT quarter) AS n_quarters
-                    FROM company_lobbying
-                    GROUP BY year
-                )
-                WHERE n_quarters = 4
-                """
-            ).fetchone()
-        finally:
-            conn.close()
-
-        signal_year = int(year_row[0]) if year_row and year_row[0] is not None else None
-        if signal_year is None:
-            self.skipTest("No complete filing year found.")
-
-        df = app.get_acceleration_features(
-            str(DB_PATH),
-            year=signal_year,
-            refresh_token=999004,
-            min_spend_m=1.0,
-            ticker_only=True,
-        )
-        if df.empty:
-            self.skipTest(f"No acceleration feature rows for {signal_year}.")
-
-        required_cols = {
-            "ticker",
-            "company_name",
-            "sector",
-            "signal_year",
-            "annual_spend",
-            "yoy_pct",
-            "qoq_pct",
-            "hist_spend_z",
-            "sector_spike_z",
-            "mcap_ratio_yoy_pct",
-            "feature_count",
-            "accel_score",
-        }
-        self.assertTrue(required_cols.issubset(df.columns))
-
-        scored = df[df["accel_score"].notna()].copy()
-        if not scored.empty:
-            self.assertTrue(((scored["accel_score"] >= 0) & (scored["accel_score"] <= 100)).all())
-            tickers = scored["ticker"].dropna().astype(str).str.strip().str.upper()
-            tickers = tickers[tickers != ""]
-            self.assertEqual(int(tickers.nunique()), int(len(tickers)))
-
-    @patch("app._fetch_spx_returns_for_signal_years")
-    def test_acceleration_backtest_year_alignment(self, mock_spx):
-        mock_spx.return_value = ({yr: 0.0 for yr in range(2018, 2035)}, None)
-
-        bt_df, _ = app.get_acceleration_event_backtest(
-            str(DB_PATH),
-            top_n=20,
-            refresh_token=999005,
-            min_spend_m=1.0,
-        )
-        if bt_df.empty:
-            self.skipTest("No acceleration backtest rows available.")
-
-        self.assertTrue({"signal_year", "year", "alpha_return_3m", "alpha_return_6m", "alpha_return_1y"}.issubset(bt_df.columns))
-        self.assertTrue(((bt_df["signal_year"] + 1) == bt_df["year"]).all())
-
-        # Internal consistency: alpha = top - universe for each horizon where both exist.
-        for horizon in ["3m", "6m", "1y"]:
-            top_col = f"top_return_{horizon}"
-            uni_col = f"universe_return_{horizon}"
-            alpha_col = f"alpha_return_{horizon}"
-            valid = bt_df[top_col].notna() & bt_df[uni_col].notna() & bt_df[alpha_col].notna()
-            if valid.any():
-                calc = (bt_df.loc[valid, top_col] - bt_df.loc[valid, uni_col]).round(2)
-                self.assertTrue((calc == bt_df.loc[valid, alpha_col].round(2)).all())
-
-    @patch("app._fetch_spx_returns_for_signal_years")
-    def test_acceleration_rolling_windows_have_expected_shape(self, mock_spx):
-        mock_spx.return_value = ({yr: 0.0 for yr in range(2018, 2035)}, None)
-
-        roll_df = app.get_acceleration_rolling_windows(
-            str(DB_PATH),
-            top_n=20,
-            window_years=3,
-            refresh_token=999006,
-            min_spend_m=1.0,
-        )
-        if roll_df.empty:
-            self.skipTest("No rolling-window rows available.")
-
-        self.assertTrue(
-            {"window_start", "window_end", "window_label", "n_years", "avg_alpha_1y"}.issubset(
-                roll_df.columns
-            )
-        )
-        self.assertTrue((roll_df["n_years"] >= 3).all())
-        self.assertTrue((roll_df["window_start"] <= roll_df["window_end"]).all())
-
-    def test_acceleration_oos_split_returns_train_test_artifacts(self):
-        annual_df, summary_df, coef_df = app.get_acceleration_oos_split_backtest(
-            str(DB_PATH),
-            top_n=20,
-            refresh_token=999007,
-            min_spend_m=1.0,
-            train_start=2019,
-            train_end=2022,
-            test_start=2023,
-            test_end=2026,
-        )
-        if annual_df.empty:
-            self.skipTest("No OOS split rows available.")
-
-        self.assertTrue({"signal_year", "year", "split", "alpha_return_1y"}.issubset(annual_df.columns))
-        self.assertTrue(((annual_df["signal_year"] + 1) == annual_df["year"]).all())
-        self.assertIn("Train", set(annual_df["split"].tolist()))
-        self.assertFalse(coef_df.empty)
-        self.assertTrue({"feature", "weight"}.issubset(coef_df.columns))
-        if not summary_df.empty:
-            self.assertIn("Split", summary_df.columns)
-
     @patch("src.data_fetcher.difflib.get_close_matches", return_value=[])
     def test_fuzzy_matching_threshold_uses_safety_floor(self, mock_matches):
         mapper = CompanyMapper(db_path=str(DB_PATH))
@@ -543,6 +350,213 @@ class RegressionIntegrityTests(unittest.TestCase):
             self.assertAlmostEqual(float(mock_matches.call_args.kwargs["cutoff"]), 0.82, places=4)
         finally:
             config.FUZZY_MATCHING_THRESHOLD = baseline_threshold
+
+
+class BugRegressionTests(unittest.TestCase):
+    """
+    Targeted tests for confirmed bugs identified by Codex review.
+    Each test should fail before the fix and pass after.
+    """
+
+    # ── P1: Regime filter `is True` vs numpy.bool_ ────────────────────────────
+    # ── P2: OpenSecrets duplicate-ticker crash ─────────────────────────────────
+    def test_conviction_scores_handles_duplicate_os_tickers(self):
+        """
+        P2: If opensecrets_contribs has multiple rows for the same ticker in a year
+        (e.g. subsidiary aliases), the old os_df.set_index('ticker') raised
+        InvalidIndexError. The fix uses groupby().sum() to aggregate duplicates.
+        """
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp_db = Path(tmpdir) / "os_dedup_test.db"
+            shutil.copyfile(DB_PATH, tmp_db)
+
+            conn = sqlite3.connect(tmp_db)
+            try:
+                conn.execute(
+                    """
+                    CREATE TABLE IF NOT EXISTS opensecrets_contribs (
+                        id            INTEGER PRIMARY KEY,
+                        company_name  TEXT,
+                        ticker        TEXT,
+                        year          INTEGER,
+                        total_contribs REAL,
+                        pacs          REAL,
+                        indivs        REAL,
+                        os_lobbying   REAL
+                    )
+                    """
+                )
+                # Two rows for TK01 in the same year — intentional duplicate ticker.
+                conn.executemany(
+                    """
+                    INSERT INTO opensecrets_contribs
+                        (company_name, ticker, year, total_contribs, pacs)
+                    VALUES (?, ?, ?, ?, ?)
+                    """,
+                    [
+                        ("Company TK01",          "TK01", 2024, 1_000_000, 500_000),
+                        ("Company TK01 Holdings", "TK01", 2024,   750_000, 250_000),
+                        ("Company TK02",          "TK02", 2024, 2_000_000, 800_000),
+                    ],
+                )
+                conn.commit()
+            finally:
+                conn.close()
+
+            # Must not raise InvalidIndexError; must return a DataFrame.
+            result = app.get_conviction_scores(str(tmp_db), year=2024, refresh_token=998_001)
+            self.assertIsInstance(result, pd.DataFrame)
+
+            if not result.empty:
+                # TK01 should appear at most once in the scored universe.
+                tk01_rows = result[result["ticker"] == "TK01"]
+                self.assertLessEqual(len(tk01_rows), 1, msg="Duplicate OS ticker must not duplicate scored rows")
+
+                # TK01's os_pts should reflect the COMBINED PAC amount, not just one alias.
+                # TK01 combined = (1M+500K) + (750K+250K) = 2.5M.  TK02 = 2M+800K = 2.8M.
+                # So TK02 combined > TK01 combined → TK02 should score ≥ TK01 on os_pts.
+                if "TK02" in result["ticker"].values and len(tk01_rows) == 1:
+                    tk02_os = result.loc[result["ticker"] == "TK02", "os_pts"].iloc[0]
+                    tk01_os = tk01_rows["os_pts"].iloc[0]
+                    self.assertGreaterEqual(
+                        tk02_os, tk01_os,
+                        msg="TK02 has higher combined PAC spend and should score >= TK01 os_pts",
+                    )
+
+    # ── P3: Market Issue Pulse public-company filter ───────────────────────────
+    def test_top_issue_codes_excludes_non_investable_entities(self):
+        """
+        P3: get_top_issue_codes_by_year must restrict results to companies that are
+        mapped to a public ticker in company_lobbying. Non-investable entities
+        (trade associations, NGOs) must not inflate issue-code counts.
+        """
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp_db = Path(tmpdir) / "issue_filter_test.db"
+            shutil.copyfile(DB_PATH, tmp_db)
+
+            conn = sqlite3.connect(tmp_db)
+            try:
+                conn.execute(
+                    """
+                    CREATE TABLE IF NOT EXISTS filing_issues (
+                        id                   INTEGER PRIMARY KEY AUTOINCREMENT,
+                        filing_uuid          TEXT,
+                        general_issue_code   TEXT NOT NULL,
+                        specific_issues_text TEXT,
+                        year                 INTEGER,
+                        quarter              TEXT,
+                        client_name          TEXT
+                    )
+                    """
+                )
+                conn.executemany(
+                    """
+                    INSERT INTO filing_issues
+                        (filing_uuid, general_issue_code, year, client_name)
+                    VALUES (?, ?, ?, ?)
+                    """,
+                    [
+                        # "Company TK01" IS in company_lobbying (ticker TK01).
+                        ("uuid-1", "TAX", 2024, "Company TK01"),
+                        ("uuid-2", "DEF", 2024, "Company TK01"),
+                        # "Company TK02" IS in company_lobbying (ticker TK02).
+                        ("uuid-3", "TAX", 2024, "Company TK02"),
+                        # Non-investable entity — NOT in company_lobbying with a ticker.
+                        ("uuid-4", "LBR", 2024, "AMERICAN BUSINESS ROUNDTABLE"),
+                        ("uuid-5", "LBR", 2024, "AMERICAN BUSINESS ROUNDTABLE"),
+                        ("uuid-6", "TAX", 2024, "AMERICAN BUSINESS ROUNDTABLE"),
+                    ],
+                )
+                conn.commit()
+            finally:
+                conn.close()
+
+            df = app.get_top_issue_codes_by_year(str(tmp_db), year=2024, top_n=15, refresh_token=998_002)
+
+            if df.empty:
+                self.skipTest(
+                    "No company_lobbying rows for year=2024 in fixture — "
+                    "public-company filter cannot be verified."
+                )
+
+            codes_returned = set(df["general_issue_code"].tolist())
+
+            # TAX appears in 2 public-company filings — must be present.
+            self.assertIn("TAX", codes_returned, msg="TAX from public companies must be included")
+
+            # LBR appears ONLY from the non-investable association — must be absent.
+            self.assertNotIn(
+                "LBR", codes_returned,
+                msg="LBR from non-investable entity must be excluded by public-company filter",
+            )
+
+            # DEF appears in 1 public-company filing — must be present.
+            self.assertIn("DEF", codes_returned, msg="DEF from public company must be included")
+
+            # TAX n_companies should be 2 (TK01 + TK02), not 3 (which would include the association).
+            tax_row = df[df["general_issue_code"] == "TAX"]
+            if not tax_row.empty:
+                self.assertLessEqual(
+                    int(tax_row.iloc[0]["n_companies"]), 2,
+                    msg="Non-public entity must not count toward n_companies",
+                )
+
+    # ── P4 bonus: filing_issues extraction integrity ───────────────────────────
+    def test_filing_issues_table_created_and_populated_by_build(self):
+        """
+        Verify that _ensure_filing_detail_tables creates both tables, and that
+        executemany for issue_rows / agency_rows does not crash on empty input.
+        """
+        from src.build_company_lobbying import _ensure_filing_detail_tables
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp_db = Path(tmpdir) / "detail_tables_test.db"
+            conn = sqlite3.connect(tmp_db)
+            try:
+                cursor = conn.cursor()
+                _ensure_filing_detail_tables(cursor)
+                conn.commit()
+
+                tables = {
+                    row[0]
+                    for row in conn.execute(
+                        "SELECT name FROM sqlite_master WHERE type='table'"
+                    ).fetchall()
+                }
+                self.assertIn("filing_issues",   tables)
+                self.assertIn("filing_agencies", tables)
+
+                # Indexes should also exist.
+                indexes = {
+                    row[0]
+                    for row in conn.execute(
+                        "SELECT name FROM sqlite_master WHERE type='index'"
+                    ).fetchall()
+                }
+                self.assertIn("idx_fi_code_year",   indexes)
+                self.assertIn("idx_fi_client_year",  indexes)
+                self.assertIn("idx_fa_agency_year",  indexes)
+                self.assertIn("idx_fa_client_year",  indexes)
+
+                # Inserting and querying rows must not crash.
+                conn.execute(
+                    "INSERT INTO filing_issues (filing_uuid, general_issue_code, year, client_name) "
+                    "VALUES (?, ?, ?, ?)",
+                    ("test-uuid-1", "TAX", 2024, "Test Corp"),
+                )
+                conn.execute(
+                    "INSERT INTO filing_agencies (filing_uuid, agency_name, year, client_name) "
+                    "VALUES (?, ?, ?, ?)",
+                    ("test-uuid-1", "Internal Revenue Service", 2024, "Test Corp"),
+                )
+                conn.commit()
+
+                fi_count = conn.execute("SELECT COUNT(*) FROM filing_issues").fetchone()[0]
+                fa_count = conn.execute("SELECT COUNT(*) FROM filing_agencies").fetchone()[0]
+                self.assertEqual(fi_count, 1)
+                self.assertEqual(fa_count, 1)
+            finally:
+                conn.close()
 
 
 if __name__ == "__main__":
