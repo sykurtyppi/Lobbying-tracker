@@ -38,6 +38,64 @@ def quarter_from_period(period: str) -> Optional[str]:
     return PERIOD_TO_QUARTER.get(normalized)
 
 
+def extract_filing_details(row, default_year: int) -> tuple[list[tuple], list[tuple]]:
+    """
+    Pull issue-code and government-agency rows out of one parsed filing.
+
+    The LDA API nests both ``general_issue_code`` and ``government_entities``
+    inside each ``lobbying_activities[]`` item (there is no top-level
+    ``government_entities`` field, and the free-text field is ``description``).
+    An older top-level list is still honoured for fixtures and legacy payloads.
+
+    Returns
+    -------
+    (issue_rows, agency_rows)
+        issue_rows : (filing_uuid, general_issue_code, specific_issues_text, year, quarter, client_name)
+        agency_rows: (filing_uuid, agency_name, year, quarter, client_name) — one per agency per filing
+    """
+    uuid        = row.get("filing_uuid")
+    filing_year = int(row.get("year", default_year) or default_year)
+    period_val  = row.get("period") or row.get("quarter") or ""
+    quarter_val = quarter_from_period(period_val) or ""
+    client      = row.get("client_name") or ""
+
+    issue_rows: list[tuple] = []
+    agency_names: list[str] = []
+
+    def _agency_name(ent) -> str:
+        if isinstance(ent, str):
+            return ent.strip()[:200]
+        if isinstance(ent, dict):
+            return (ent.get("name") or ent.get("government_entity") or "").strip()[:200]
+        return ""
+
+    activities = row.get("lobbying_activities")
+    if isinstance(activities, list):
+        for act in activities:
+            if not isinstance(act, dict):
+                continue
+            code = (act.get("general_issue_code") or "").strip().upper()
+            if code:
+                text = (act.get("description") or act.get("specific_issues") or "").strip()[:500]
+                issue_rows.append((uuid, code, text, filing_year, quarter_val, client))
+            entities = act.get("government_entities")
+            if isinstance(entities, list):
+                agency_names.extend(_agency_name(e) for e in entities)
+
+    legacy_entities = row.get("government_entities")
+    if isinstance(legacy_entities, list):
+        agency_names.extend(_agency_name(e) for e in legacy_entities)
+
+    seen: set[str] = set()
+    agency_rows: list[tuple] = []
+    for name in agency_names:
+        if name and name not in seen:
+            seen.add(name)
+            agency_rows.append((uuid, name, filing_year, quarter_val, client))
+
+    return issue_rows, agency_rows
+
+
 def is_allowed_filing_type(filing_type: Optional[str], allowed_types) -> bool:
     """Check filing type using case-insensitive substring matching."""
     if not allowed_types:
@@ -735,40 +793,9 @@ def backfill_filing_detail_tables_for_year(
     agency_rows: list[tuple] = []
 
     for _, row in filings_df.iterrows():
-        uuid        = row.get("filing_uuid")
-        filing_year = int(row.get("year", year))
-        period_val  = row.get("period") or row.get("quarter") or ""
-        quarter_val = quarter_from_period(period_val) or ""
-        client      = row.get("client_name") or ""
-
-        # ── Lobbying issue codes ───────────────────────────────────────────
-        activities = row.get("lobbying_activities")
-        if isinstance(activities, list):
-            for act in activities:
-                if not isinstance(act, dict):
-                    continue
-                code = (act.get("general_issue_code") or "").strip().upper()
-                if not code:
-                    continue
-                specific = (act.get("specific_issues") or "")[:500]
-                issue_rows.append((uuid, code, specific, filing_year, quarter_val, client))
-
-        # ── Government agency targets ──────────────────────────────────────
-        entities = row.get("government_entities")
-        if isinstance(entities, list):
-            for ent in entities:
-                if isinstance(ent, str):
-                    agency_name = ent.strip()[:200]
-                elif isinstance(ent, dict):
-                    agency_name = (
-                        ent.get("name") or ent.get("government_entity") or ""
-                    ).strip()[:200]
-                else:
-                    continue
-                if agency_name:
-                    agency_rows.append(
-                        (uuid, agency_name, filing_year, quarter_val, client)
-                    )
+        f_issues, f_agencies = extract_filing_details(row, year)
+        issue_rows.extend(f_issues)
+        agency_rows.extend(f_agencies)
 
     _log(
         f"[backfill_detail] Year {year}: "
@@ -1175,36 +1202,10 @@ def build_company_lobbying_for_year(
             )
         )
 
-        # ── Extract lobbying issue codes (general_issue_code) ─────────────
-        activities = row.get("lobbying_activities")
-        if isinstance(activities, list):
-            for act in activities:
-                if not isinstance(act, dict):
-                    continue
-                code = (act.get("general_issue_code") or "").strip().upper()
-                if not code:
-                    continue
-                specific = (act.get("specific_issues") or "")[:500]
-                issue_rows.append(
-                    (uuid, code, specific, filing_year, quarter_val, client)
-                )
-
-        # ── Extract government agency targets ─────────────────────────────
-        entities = row.get("government_entities")
-        if isinstance(entities, list):
-            for ent in entities:
-                if isinstance(ent, str):
-                    agency_name = ent.strip()[:200]
-                elif isinstance(ent, dict):
-                    agency_name = (
-                        ent.get("name") or ent.get("government_entity") or ""
-                    ).strip()[:200]
-                else:
-                    continue
-                if agency_name:
-                    agency_rows.append(
-                        (uuid, agency_name, filing_year, quarter_val, client)
-                    )
+        # ── Issue codes + government agency targets (per activity) ────────
+        f_issues, f_agencies = extract_filing_details(row, filing_year)
+        issue_rows.extend(f_issues)
+        agency_rows.extend(f_agencies)
 
     # ------------------------------------------------------------------
     # 3) Aggregate to company-year-quarter (pre-write validation stage)

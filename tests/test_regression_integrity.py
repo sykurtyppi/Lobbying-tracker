@@ -502,6 +502,72 @@ class BugRegressionTests(unittest.TestCase):
                 )
 
     # ── P4 bonus: filing_issues extraction integrity ───────────────────────────
+    def test_extract_filing_details_reads_nested_activities(self):
+        """
+        Regression: government_entities and the free-text description live inside
+        each lobbying_activities[] item in the LDA API payload. The old extractor
+        read them from the filing top level, so filing_agencies was always empty
+        and specific_issues_text was always blank.
+        """
+        from src.build_company_lobbying import extract_filing_details
+
+        row = {
+            "filing_uuid": "abc-123",
+            "year": 2026,
+            "period": "first_quarter",
+            "client_name": "Test Corp",
+            "lobbying_activities": [
+                {
+                    "general_issue_code": "imm",
+                    "description": "H.R. 1 immigration provisions",
+                    "government_entities": [
+                        {"id": 2, "name": "HOUSE OF REPRESENTATIVES"},
+                        {"id": 39, "name": "State, Dept of (DOS)"},
+                    ],
+                },
+                {
+                    "general_issue_code": "TAX",
+                    "description": "",
+                    "government_entities": [
+                        {"id": 2, "name": "HOUSE OF REPRESENTATIVES"},  # duplicate across activities
+                        "Treasury, Dept of",                              # legacy string form
+                    ],
+                },
+                {"general_issue_code": "", "government_entities": [{"name": "SENATE"}]},  # no code, still an agency
+                "not-a-dict",
+            ],
+        }
+
+        issues, agencies = extract_filing_details(row, default_year=2020)
+
+        self.assertEqual(
+            issues,
+            [
+                ("abc-123", "IMM", "H.R. 1 immigration provisions", 2026, "Q1", "Test Corp"),
+                ("abc-123", "TAX", "", 2026, "Q1", "Test Corp"),
+            ],
+        )
+        self.assertEqual(
+            [a[1] for a in agencies],
+            ["HOUSE OF REPRESENTATIVES", "State, Dept of (DOS)", "Treasury, Dept of", "SENATE"],
+        )
+        self.assertTrue(all(a[2:] == (2026, "Q1", "Test Corp") for a in agencies))
+
+        # Missing / malformed activities produce nothing and never raise.
+        self.assertEqual(extract_filing_details({"filing_uuid": "x"}, 2026), ([], []))
+        self.assertEqual(
+            extract_filing_details({"filing_uuid": "x", "lobbying_activities": None}, 2026), ([], [])
+        )
+
+        # A legacy top-level list is still honoured (fixtures / older payloads).
+        legacy = {"filing_uuid": "y", "year": 2024, "period": "third_quarter",
+                  "client_name": "Old Co", "government_entities": ["EPA", "EPA"]}
+        self.assertEqual(
+            extract_filing_details(legacy, 2024)[1],
+            [("y", "EPA", 2024, "Q3", "Old Co")],
+        )
+
+
     def test_filing_issues_table_created_and_populated_by_build(self):
         """
         Verify that _ensure_filing_detail_tables creates both tables, and that
