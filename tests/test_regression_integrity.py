@@ -1,4 +1,5 @@
 import atexit
+import csv
 import shutil
 import sqlite3
 import tempfile
@@ -748,6 +749,59 @@ class BugRegressionTests(unittest.TestCase):
                 self.assertEqual(fa_count, 1)
             finally:
                 conn.close()
+
+
+class UnmatchedExportSafetyTests(unittest.TestCase):
+    @staticmethod
+    def _fixture(directory):
+        database = Path(directory) / "filings.sqlite"
+        output = Path(directory) / "unmatched.csv"
+        with sqlite3.connect(database) as conn:
+            conn.execute(
+                "CREATE TABLE lobbying_filings (client_name TEXT, year INTEGER, amount REAL)"
+            )
+            conn.execute(
+                "CREATE TABLE company_lobbying (company_name TEXT, ticker TEXT)"
+            )
+            conn.executemany(
+                "INSERT INTO lobbying_filings VALUES (?, 2025, ?)",
+                [("Acme Corp", 123.0), ("Beta Corp", 50.0)],
+            )
+        return database, output
+
+    def test_rerun_preserves_manually_filled_ticker(self):
+        from src import export_unmatched_companies as exporter
+
+        self.assertIsNotNone(exporter.CompanyMapper)
+        export_unmatched = exporter.export_unmatched
+        with tempfile.TemporaryDirectory() as tmp:
+            database, output = self._fixture(tmp)
+            export_unmatched(str(database), str(output))
+            with output.open(newline="") as stream:
+                rows = list(csv.DictReader(stream))
+            self.assertEqual(len(rows), 2)
+            next(row for row in rows if row["company_name"] == "Acme Corp")["TICKER"] = "ACME"
+            with output.open("w", newline="") as stream:
+                writer = csv.DictWriter(stream, fieldnames=list(rows[0]))
+                writer.writeheader()
+                writer.writerows(rows)
+            before = output.read_bytes()
+
+            with self.assertRaisesRegex(ValueError, "(?i)(ticker|mapping|overwrite)"):
+                export_unmatched(str(database), str(output))
+            self.assertEqual(output.read_bytes(), before)
+
+    def test_blank_output_can_be_refreshed(self):
+        from src.export_unmatched_companies import export_unmatched
+
+        with tempfile.TemporaryDirectory() as tmp:
+            database, output = self._fixture(tmp)
+            export_unmatched(str(database), str(output))
+            export_unmatched(str(database), str(output))
+            with output.open(newline="") as stream:
+                rows = list(csv.DictReader(stream))
+            self.assertEqual(len(rows), 2)
+            self.assertTrue(all(not row["TICKER"] for row in rows))
 
 
 if __name__ == "__main__":

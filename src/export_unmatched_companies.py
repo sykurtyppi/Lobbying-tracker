@@ -13,6 +13,7 @@ You then fill in the TICKER column and run the second script to generate
 a config snippet for CUSTOM_TICKER_MAPPINGS.
 """
 
+import csv
 import sqlite3
 import pandas as pd
 from pathlib import Path
@@ -29,6 +30,22 @@ DB_PATH = "data/lobbying_data.db"
 OUTPUT_CSV = "data/unmatched_companies.csv"
 
 def export_unmatched(db_path: str = DB_PATH, output_csv: str = OUTPUT_CSV):
+    # Refuse before opening the database or rebuilding suggestions: rerunning
+    # the export must not erase a ticker that someone entered in this CSV.
+    output_path = Path(output_csv)
+    if output_path.exists():
+        with output_path.open(newline="") as stream:
+            filled = any(
+                str(row.get("TICKER", "")).strip()
+                for row in csv.DictReader(stream)
+            )
+        if filled:
+            raise ValueError(
+                "Refusing to overwrite existing manual ticker mapping in "
+                f"{output_csv}: a non-empty TICKER is already filled. Delete "
+                "the file or pass a new output path to re-export."
+            )
+
     conn = sqlite3.connect(db_path)
 
     # Aggregate raw filings to one row per alias across all available years.
