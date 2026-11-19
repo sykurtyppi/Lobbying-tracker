@@ -29,16 +29,27 @@ except Exception:
 DB_PATH = "data/lobbying_data.db"
 OUTPUT_CSV = "data/unmatched_companies.csv"
 
-def export_unmatched(db_path: str = DB_PATH, output_csv: str = OUTPUT_CSV):
-    # Refuse before opening the database or rebuilding suggestions: rerunning
-    # the export must not erase a ticker that someone entered in this CSV.
+def _refuse_filled_export(output_csv: str):
+    """Fail closed when an existing CSV is not clearly free of manual tickers."""
     output_path = Path(output_csv)
     if output_path.exists():
         with output_path.open(newline="") as stream:
-            filled = any(
-                str(row.get("TICKER", "")).strip()
-                for row in csv.DictReader(stream)
-            )
+            reader = csv.DictReader(stream)
+            if reader.fieldnames is None or reader.fieldnames.count("TICKER") != 1:
+                raise ValueError(
+                    f"Refusing to overwrite {output_csv}: unrecognized CSV format "
+                    "or missing TICKER column. Use a new output path to re-export."
+                )
+            filled = False
+            for row in reader:
+                if None in row or any(value is None for value in row.values()):
+                    raise ValueError(
+                        f"Refusing to overwrite {output_csv}: malformed CSV row. "
+                        "Use a new output path to re-export."
+                    )
+                if row["TICKER"].strip():
+                    filled = True
+                    break
         if filled:
             raise ValueError(
                 "Refusing to overwrite existing manual ticker mapping in "
@@ -46,6 +57,9 @@ def export_unmatched(db_path: str = DB_PATH, output_csv: str = OUTPUT_CSV):
                 "the file or pass a new output path to re-export."
             )
 
+def export_unmatched(db_path: str = DB_PATH, output_csv: str = OUTPUT_CSV):
+    # Refuse before opening the database or rebuilding suggestions.
+    _refuse_filled_export(output_csv)
     conn = sqlite3.connect(db_path)
 
     # Aggregate raw filings to one row per alias across all available years.
@@ -121,9 +135,11 @@ def export_unmatched(db_path: str = DB_PATH, output_csv: str = OUTPUT_CSV):
     # Add empty TICKER column for you to fill
     unmatched["TICKER"] = ""
 
-    unmatched.to_csv(output_csv, index=False)
-
+    # The database is no longer needed; close it even if the late guard refuses.
     conn.close()
+    # A user may have filled the CSV while the database and mapper were read.
+    _refuse_filled_export(output_csv)
+    unmatched.to_csv(output_csv, index=False)
 
     non_public_n = int(unmatched["likely_non_public"].sum()) if not unmatched.empty else 0
     suggested_n = int(unmatched["suggested_ticker"].notna().sum()) if not unmatched.empty else 0
